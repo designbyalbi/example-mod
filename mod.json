@@ -3,7 +3,7 @@
 	"gd": {
 		"win": "2.2081"
 	},
-	"version": "v2.0.2",
+	"version": "v2.0.3",
 	"id": "ai.predictivebuffer",
 	"name": "Predictive Input Buffer",
 	"developer": "lilWC",
@@ -56,6 +56,12 @@
 			"default": 3.0,
 			"min": 0,
 			"max": 20
+		},
+		"assume-tap": {
+			"type": "bool",
+			"name": "Predict a tap, not a hold",
+			"description": "Assume you release shortly after a cube takes off, instead of holding the button forever. Holding forever makes the predictor think you bunny-hop into the next obstacle, which hides valid rescues.",
+			"default": true
 		},
 		"ignore-unmodeled": {
 			"type": "bool",
