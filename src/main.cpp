@@ -1,4 +1,4 @@
-// Predictive Input Buffer v2.0.4 - single-file version
+// Predictive Input Buffer v2.0.5 - single-file version
 // Sections: 1 Config | 2 Ghost simulation | 3 Input buffer | 4 Hooks
 
 #include <Geode/Geode.hpp>
@@ -761,7 +761,10 @@ namespace ib {
         // Prediction horizons, in frames @ 60fps (28 / 38 / 72 ticks at the default tick).
         constexpr float HORIZON_MINI_WAVE = 7.f;
         constexpr float HORIZON_WAVE = 9.5f;
-        constexpr float HORIZON_OTHER = 18.f;
+        // A cube jump stays airborne for ~23 frames, so ground modes must look further than that
+        // or an early press that lands on a hazard after the horizon is wrongly judged safe.
+        constexpr float HORIZON_GROUND = 32.f;  // cube, ball, robot, spider
+        constexpr float HORIZON_FLYING = 18.f;  // ufo, swing (never "land", so keep sims short)
 
         // Tuned at the default 0.25-frame tick; scaled with sim::scaled().
         constexpr int RAPID_GAP_TICKS = 8;     // inputs closer than this count as spam
@@ -889,7 +892,9 @@ namespace ib {
         if (maxDelay <= 0) {
             return pass(down, "window is 0 ticks (preset Off?)");
         }
-        int horizon = framesToTicks(mini ? HORIZON_MINI_WAVE : (anyWave ? HORIZON_WAVE : HORIZON_OTHER), tick);
+        bool groundMode = sim::isCube(p1) || p1->m_isBall || p1->m_isRobot || p1->m_isSpider;
+        int horizon = framesToTicks(
+            mini ? HORIZON_MINI_WAVE : (anyWave ? HORIZON_WAVE : (groundMode ? HORIZON_GROUND : HORIZON_FLYING)), tick);
         char const* name = down ? "PRESS" : "RELEASE";
         if (cfg.debug) {
             log::info("[InputBuffer] {} cube={} wave={} dual={} onGround={} window={}t horizon={}t x={:.0f} speed={:.2f} tick={:.3f}",
@@ -1079,7 +1084,7 @@ namespace {
 
 $on_mod(Loaded) {
     ib::reloadConfig();
-    log::info("[InputBuffer] v2.0.4 loaded");
+    log::info("[InputBuffer] v2.0.5 loaded");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
