@@ -3,7 +3,7 @@
 	"gd": {
 		"win": "2.2081"
 	},
-	"version": "v2.0.0",
+	"version": "v2.0.2",
 	"id": "ai.predictivebuffer",
 	"name": "Predictive Input Buffer",
 	"developer": "lilWC",
@@ -56,6 +56,12 @@
 			"default": 3.0,
 			"min": 0,
 			"max": 20
+		},
+		"ignore-unmodeled": {
+			"type": "bool",
+			"name": "Predict through pads/orbs (experimental)",
+			"description": "By default the prediction stops when it touches a pad, orb, dual/mirror/teleport portal, etc. and your raw input is used. Turn this on to ignore those objects and keep predicting. Can mispredict jumps that rely on them.",
+			"default": false
 		},
 		"debug": {
 			"type": "bool",
