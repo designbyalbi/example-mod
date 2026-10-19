@@ -8,10 +8,31 @@ on:
 
 jobs:
   build:
-    name: Windows
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: Windows
+            os: windows-latest
+
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Build the mod
+        id: build
         uses: geode-sdk/build-geode-mod@main
+        with:
+          # Use the version from your mod.json (5.11.2)
+          # Change to "nightly" if you hit the SequenceTriggerState / EffectManagerState errors
+          sdk: given
+          combine: true
+          target: ${{ matrix.config.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.config.name }} Build
+          path: ${{ steps.build.outputs.build-output }}
