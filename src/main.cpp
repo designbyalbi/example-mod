@@ -1,4 +1,4 @@
-// Predictive Input Buffer v2.0.0 - single-file version
+// Predictive Input Buffer v2.0.2 - single-file version
 // Sections: 1 Config | 2 Ghost simulation | 3 Input buffer | 4 Hooks
 
 #include <Geode/Geode.hpp>
@@ -32,6 +32,7 @@ namespace ib {
         bool landingBuffer = true;
         bool hotkey = true;
         bool debug = false;
+        bool ignoreUnmodeled = false; // keep predicting through pads/orbs/etc. instead of giving up
         float framesAll = 0.5f;   // buffer window, frames @ 60fps (all modes except wave)
         float framesWave = 0.5f;  // buffer window, frames @ 60fps (wave)
         double budgetMs = 3.0;    // max time a single press prediction may take; 0 = unlimited
@@ -83,6 +84,7 @@ namespace ib {
         c.landingBuffer = mod->getSettingValue<bool>("landing-buffer");
         c.hotkey = mod->getSettingValue<bool>("hotkey");
         c.debug = mod->getSettingValue<bool>("debug");
+        c.ignoreUnmodeled = mod->getSettingValue<bool>("ignore-unmodeled");
         c.budgetMs = mod->getSettingValue<double>("sim-budget-ms");
 
         auto preset = mod->getSettingValue<std::string>("preset");
@@ -153,6 +155,9 @@ namespace ib::sim {
     // each button press gets a time budget; check timedOut() after sim calls
     void beginQuery(double budgetMs);
     bool timedOut();
+    bool unsure();            // last run() stopped at a thing it can't model
+    int unsureObject();       // object ID of that thing
+    int unsureType();         // its GameObjectType
 
     bool isCube(PlayerObject* player);
 
@@ -216,6 +221,8 @@ namespace ib::sim {
         bool s_active = false;
         bool s_died = false;
         bool s_unsure = false;
+        int s_unsureObject = 0;
+        int s_unsureType = 0;
         float s_tick = DEFAULT_TICK;
 
         std::chrono::steady_clock::time_point s_deadline = std::chrono::steady_clock::time_point::max();
@@ -360,6 +367,8 @@ namespace ib::sim {
         }
 
         void touchSpecial(PlayerObject* player, GameObject* object) {
+            s_unsureObject = object->m_objectID;
+            s_unsureType = static_cast<int>(object->m_objectType);
             float speed = speedOf(object->m_objectID);
             if (speed > 0.f) {
                 if (!MODEL_SPEED) {
@@ -433,8 +442,11 @@ namespace ib::sim {
                     return;
                 }
                 default:
-                    // pads, orbs, dual/solo/mirror/teleport: not modeled
-                    s_unsure = true;
+                    // pads, orbs, dual/solo/mirror/teleport: not modeled.
+                    // Default: stop predicting (safe). Optional: ignore the object and keep going.
+                    if (!ib::config().ignoreUnmodeled) {
+                        s_unsure = true;
+                    }
                     return;
             }
         }
@@ -488,6 +500,9 @@ namespace ib::sim {
     }
 
     bool timedOut() { return s_timedOut; }
+    bool unsure() { return s_unsure; }
+    int unsureObject() { return s_unsureObject; }
+    int unsureType() { return s_unsureType; }
 
     bool isCube(PlayerObject* p) {
         return !(p->m_isShip || p->m_isBall || p->m_isBird || p->m_isDart || p->m_isRobot || p->m_isSpider || p->m_isSwing);
@@ -698,7 +713,7 @@ namespace ib {
     private:
         enum class Phase { Idle, Waiting, Holding };
 
-        bool pass(bool down);
+        bool pass(bool down, char const* why = nullptr);
         void clearPending();
         void schedule(bool state, int countdown, int hold);
         void send(PlayLayer* layer, bool down);
@@ -748,8 +763,11 @@ namespace ib {
         return instance;
     }
 
-    bool InputBuffer::pass(bool down) {
+    bool InputBuffer::pass(bool down, char const* why) {
         appliedInput_ = down;
+        if (why && config().debug) {
+            log::info("[InputBuffer]   not buffered: {}", why);
+        }
         return false;
     }
 
@@ -856,16 +874,20 @@ namespace ib {
         float tick = sim::tickLength();
         int maxDelay = framesToTicks(anyWave ? cfg.framesWave : cfg.framesAll, tick);
         if (maxDelay <= 0) {
-            return pass(down);
+            return pass(down, "window is 0 ticks (preset Off?)");
         }
         int horizon = framesToTicks(mini ? HORIZON_MINI_WAVE : (anyWave ? HORIZON_WAVE : HORIZON_OTHER), tick);
         char const* name = down ? "PRESS" : "RELEASE";
+        if (cfg.debug) {
+            log::info("[InputBuffer] {} cube={} wave={} dual={} onGround={} window={}t horizon={}t",
+                name, sim::isCube(p1), anyWave, dual, p1->m_isOnGround, maxDelay, horizon);
+        }
 
         sim::beginQuery(cfg.budgetMs);
         bool diedEarly = false;
         int base = sim::run(layer, p1, p2, dual, 0, down, horizon, &diedEarly);
         if (sim::timedOut()) {
-            return pass(down);
+            return pass(down, "prediction exceeded the time budget (raise it in settings)");
         }
 
         // ---- cube landing buffer ----
@@ -876,14 +898,14 @@ namespace ib {
         if (cfg.landingBuffer && down && !dual && !anyWave && !p1->m_isOnGround && sim::isCube(p1)) {
             int land = sim::ticksToLanding(layer, p1, maxDelay);
             if (sim::timedOut()) {
-                return pass(down);
+                return pass(down, "prediction exceeded the time budget (raise it in settings)");
             }
             if (land > 0) {
                 int fire = std::max(0, land - LANDING_LEAD);
                 bool diedLate = false;
                 int ret = sim::run(layer, p1, p2, dual, fire, down, horizon, &diedLate);
                 if (sim::timedOut()) {
-                    return pass(down);
+                    return pass(down, "prediction exceeded the time budget (raise it in settings)");
                 }
                 if (!diedLate && ret >= std::min(base, horizon)) {
                     if (cfg.debug) {
@@ -897,7 +919,10 @@ namespace ib {
         }
 
         if (base >= horizon) {
-            return pass(down); // pressing right now already survives the whole horizon
+            if (cfg.debug && sim::unsure()) {
+                log::info("[InputBuffer]   prediction stopped at unmodeled object id {} (type {}) and was treated as safe", sim::unsureObject(), sim::unsureType());
+            }
+            return pass(down, "pressing now looks safe (or prediction hit an unmodeled object)");
         }
 
         // ---- search for the smallest delay that clearly helps ----
@@ -908,7 +933,7 @@ namespace ib {
             for (int k = 1; k <= maxDelay; ++k) {
                 int ret = sim::run(layer, p1, p2, dual, k, down, horizon, &diedEarly);
                 if (sim::timedOut()) {
-                    return pass(down);
+                    return pass(down, "prediction exceeded the time budget (raise it in settings)");
                 }
                 if (diedEarly) {
                     break;
@@ -926,7 +951,7 @@ namespace ib {
             for (int k = 1; k <= maxDelay; ++k) {
                 int ret = sim::run(layer, p1, p2, dual, k, down, horizon, &diedEarly);
                 if (sim::timedOut()) {
-                    return pass(down);
+                    return pass(down, "prediction exceeded the time budget (raise it in settings)");
                 }
                 if (diedEarly) {
                     break;
@@ -943,7 +968,10 @@ namespace ib {
         }
 
         if (saved <= 0) {
-            return pass(down);
+            if (cfg.debug) {
+                log::info("[InputBuffer]   pressing now dies after {} of {} ticks; no delay up to {} ticks does clearly better", base, horizon, maxDelay);
+            }
+            return pass(down, "no delay inside the window helps");
         }
 
         if (cfg.debug) {
@@ -1027,7 +1055,7 @@ namespace {
 
 $on_mod(Loaded) {
     ib::reloadConfig();
-    log::info("[InputBuffer] v2.0.0 loaded");
+    log::info("[InputBuffer] v2.0.2 loaded");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
