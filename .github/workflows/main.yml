@@ -1,23 +1,20 @@
-name: Build
+name: Build Mod
 
 on:
   workflow_dispatch:
   push:
     branches:
-      
-"**"
+      - main
 
 jobs:
   build:
+    name: Windows
     runs-on: windows-latest
     steps:
-      
-uses: actions/checkout@v4
-uses: geode-sdk/build-geode-mod@main
-    id: build
-    with:
-      sdk: nightly
-uses: actions/upload-artifact@v4
-  with:
-    name: Build Output
-    path: ${{ steps.build.outputs.build-output }}
+      - uses: actions/checkout@v4
+
+      - name: Build the mod
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          bindings: geode-sdk/bindings
+          bindings-ref: main
