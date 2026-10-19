@@ -334,6 +334,14 @@ namespace {
         }
     }
 
+    float simDt() {
+        float dt = buf.tickLength;
+        if (!(dt > 0.001f && dt < 2.0f)) {
+            dt = TICK;
+        }
+        return dt;
+    }
+
     int simulate(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, bool* diedBeforeInput) {
         *diedBeforeInput = false;
         if (!buf.ghost1) {
@@ -350,10 +358,7 @@ namespace {
             copyState(buf.ghost2, p2);
         }
 
-        float dt = buf.tickLength;
-        if (!(dt > 0.001f && dt < 2.0f)) {
-            dt = TICK;
-        }
+        float dt = simDt();
 
         if (delay > 0) {
             pressGhost(buf.ghost1, !down);
@@ -449,6 +454,41 @@ namespace {
         return survived;
     }
 
+    // Ticks until the cube touches the ground with no button held. Returns -1 if
+    // it dies first, meets something the sim can't model, or doesn't land within
+    // maxTicks.
+    int ticksToLanding(PlayLayer* layer, PlayerObject* p1, int maxTicks) {
+        if (!buf.ghost1) {
+            return -1;
+        }
+        buf.simulating = true;
+        buf.ghostDied = false;
+        buf.simUnsure = false;
+        simTouched.clear();
+
+        copyState(buf.ghost1, p1);
+        pressGhost(buf.ghost1, false);
+
+        float dt = simDt();
+        int landed = -1;
+        for (int tick = 1; tick <= maxTicks; ++tick) {
+            advanceGhost(buf.ghost1, dt);
+            if (buf.ghostDied) {
+                break;
+            }
+            checkGhost(layer, buf.ghost1, dt);
+            if (buf.simUnsure || buf.ghostDied) {
+                break;
+            }
+            if (buf.ghost1->m_isOnGround) {
+                landed = tick;
+                break;
+            }
+        }
+        buf.simulating = false;
+        return landed;
+    }
+
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer) {
@@ -529,6 +569,28 @@ namespace {
 
         bool diedEarly = false;
         int base = simulate(layer, p1, p2, dual, 0, down, horizon, &diedEarly);
+
+        // Cube landing buffer. A press in mid-air does nothing in-game, and a tap
+        // is gone before touchdown, so the jump never happens. Work out when the
+        // cube lands with no input and fire the press right then, as long as that
+        // is inside the buffer window and no worse than pressing now. This has to
+        // run before the "immediate press is safe" shortcut below, because the
+        // sim holds the button down forever and would call a lost tap safe.
+        if (down && maxDelay > 0 && !dual && !anyWave && !p1->m_isOnGround && inMode(p1, Mode::Cube)) {
+            int land = ticksToLanding(layer, p1, maxDelay);
+            if (land > 0) {
+                bool diedLate = false;
+                int ret = simulate(layer, p1, p2, dual, land, down, horizon, &diedLate);
+                if (!diedLate && ret >= std::min(base, horizon)) {
+                    std::printf("[InputBuffer] *** LANDING BUFFER +%d TICKS (%.2f frames @ 60fps) %s! (Frame0: %d -> Delayed: %d) [Limit: %d] ***\n",
+                        land, static_cast<double>(static_cast<float>(land) * TICK), name, base, ret, maxDelay);
+                    buf.pendingState = down;
+                    buf.pending = land;
+                    return true;
+                }
+            }
+        }
+
         if (base >= horizon || maxDelay <= 0) {
             buf.appliedInput = down;
             return false;
