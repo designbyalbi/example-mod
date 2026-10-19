@@ -27,7 +27,7 @@ jobs:
         with:
           # Use the version from your mod.json (5.11.2)
           # Change to "nightly" if you hit the SequenceTriggerState / EffectManagerState errors
-          sdk: given
+          sdk: nightly
           combine: true
           target: ${{ matrix.config.target }}
 
