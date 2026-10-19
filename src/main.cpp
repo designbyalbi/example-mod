@@ -1,388 +1,571 @@
+// Predictive Input Buffer v2.0.0 - single-file version
+// Sections: 1 Config | 2 Ghost simulation | 3 Input buffer | 4 Hooks
+
 #include <Geode/Geode.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/GameObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
-#include <Geode/modify/LevelEditorLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
+#include <Geode/ui/Notification.hpp>
 #include <Windows.h>
+
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
-#include <cstdio>
+#include <string>
 #include <utility>
 #include <vector>
 
 using namespace geode::prelude;
 
-namespace {
-    constexpr int HOOK_PRIORITY = -1000000;
-    constexpr float TICK = 0.25f;
-    constexpr int STAGE_COUNT = 5;
+// ======================================================================================
+// 1. CONFIG
+// ======================================================================================
 
-    // The landing buffer presses this many ticks BEFORE touchdown and keeps the
-    // button down until the touchdown tick has passed, so the jump comes out on
-    // the first possible tick, exactly like holding the button through a landing.
-    constexpr int LANDING_LEAD = 1;
-
-    // Prints a line every time a buffered press/release is actually delivered,
-    // with whether the cube was on the ground at that moment.
-    constexpr bool DEBUG_DELIVERY = true;
-
-    constexpr uint64_t typeBit(GameObjectType type) {
-        return 1ull << static_cast<int>(type);
-    }
-
-    constexpr uint64_t COLLIDING_TYPES = typeBit(GameObjectType::Solid) | typeBit(GameObjectType::Hazard) | typeBit(GameObjectType::Slope) |
-                                         typeBit(GameObjectType::CollisionObject) | typeBit(GameObjectType::AnimatedHazard);
-
-    // Which portal families the ghost sim models. Set one to false and that family
-    // becomes a "stop the sim, don't delay" boundary instead. Handy for bisecting
-    // a crash or a weird prediction.
-    constexpr bool MODEL_GRAVITY = true;
-    constexpr bool MODEL_SIZE = true;
-    constexpr bool MODEL_SPEED = true;
-    constexpr bool MODEL_MODE = true;
-
-    // Portals the ghost applies to itself directly (the game never activates them,
-    // so no shared object state is touched).
-    constexpr uint64_t MODELED_TYPES = typeBit(GameObjectType::NormalGravityPortal) | typeBit(GameObjectType::InverseGravityPortal) |
-                                       typeBit(GameObjectType::RegularSizePortal) | typeBit(GameObjectType::MiniSizePortal) |
-                                       typeBit(GameObjectType::CubePortal) | typeBit(GameObjectType::ShipPortal) |
-                                       typeBit(GameObjectType::BallPortal) | typeBit(GameObjectType::UfoPortal) |
-                                       typeBit(GameObjectType::WavePortal) | typeBit(GameObjectType::RobotPortal) |
-                                       typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal);
-
-    // Things the sim can't model yet. If the ghost touches one, the sim stops and
-    // the buffer stands down instead of guessing. Pads and orbs are next stage.
-    constexpr uint64_t UNMODELED_TYPES = typeBit(GameObjectType::YellowJumpPad) | typeBit(GameObjectType::PinkJumpPad) |
-                                         typeBit(GameObjectType::RedJumpPad) | typeBit(GameObjectType::GravityPad) |
-                                         typeBit(GameObjectType::SpiderPad) | typeBit(GameObjectType::YellowJumpRing) |
-                                         typeBit(GameObjectType::PinkJumpRing) | typeBit(GameObjectType::RedJumpRing) |
-                                         typeBit(GameObjectType::GravityRing) | typeBit(GameObjectType::GreenRing) |
-                                         typeBit(GameObjectType::DropRing) | typeBit(GameObjectType::CustomRing) |
-                                         typeBit(GameObjectType::DashRing) | typeBit(GameObjectType::GravityDashRing) |
-                                         typeBit(GameObjectType::SpiderOrb) | typeBit(GameObjectType::DualPortal) |
-                                         typeBit(GameObjectType::SoloPortal) | typeBit(GameObjectType::InverseMirrorPortal) |
-                                         typeBit(GameObjectType::NormalMirrorPortal) | typeBit(GameObjectType::TeleportPortal) |
-                                         typeBit(GameObjectType::GravityTogglePortal);
-
-    constexpr uint64_t SPECIAL_TYPES = MODELED_TYPES | UNMODELED_TYPES;
-
-    struct Stage {
-        bool enabled;
-        int ticksAll;
-        int ticksWave;
-        char const* message;
-    };
-
-    constexpr Stage STAGES[STAGE_COUNT] = {
-        { true, 2, 2, "[InputBuffer] F6 Cycle -> STAGE 1: 2 Ticks All | 2 Ticks Wave (0.5f @ 60fps)" },
-        { true, 4, 4, "[InputBuffer] F6 Cycle -> STAGE 2: 4 Ticks All | 4 Ticks Wave (1.0f @ 60fps)" },
-        { true, 8, 8, "[InputBuffer] F6 Cycle -> STAGE 3: 8 Ticks All | 8 Ticks Wave (2.0f @ 60fps)" },
-        { true, 16, 8, "[InputBuffer] F6 Cycle -> STAGE 4: 16 Ticks All | 8 Ticks Wave (4.0f / 2.0f @ 60fps)" },
-        { false, 0, 0, "[InputBuffer] F6 Cycle -> STAGE 5: OFF (100% Raw Input)" },
-    };
-
-    struct Buffer {
-        PlayerObject* ghost1 = nullptr;
-        PlayerObject* ghost2 = nullptr;
-        bool simulating = false;
-        bool injecting = false;
-        bool ghostDied = false;
-        bool realInput = false;
-        bool appliedInput = false;
-        bool isPlayer1 = true;
+namespace ib {
+    struct Config {
         bool enabled = true;
-        int stage = 0;
-        int ticksAll = 2;
-        int ticksWave = 2;
-        int pending = -1;
-        bool pendingState = true;
-        bool releaseQueued = false;
-        float tickLength = TICK;
-        int sinceInput = 999;
-        int rapid = 0;
-        bool simUnsure = false;
-        int holdLeft = 0;
-    } buf;
+        bool landingBuffer = true;
+        bool hotkey = true;
+        bool debug = false;
+        float framesAll = 0.5f;   // buffer window, frames @ 60fps (all modes except wave)
+        float framesWave = 0.5f;  // buffer window, frames @ 60fps (wave)
+        double budgetMs = 3.0;    // max time a single press prediction may take; 0 = unlimited
+    };
 
-    void resetPending() {
-        buf.pending = -1;
-        buf.releaseQueued = false;
-        buf.holdLeft = 0;
+    // Cached snapshot of the mod settings.
+    Config const& config();
+    void reloadConfig();
+
+    // Advance Light -> Medium -> Heavy -> Max -> Off -> Light and persist it to settings.
+    void cyclePreset();
+
+    // Convert a window in frames (@60fps) to physics ticks for the current tick length.
+    int framesToTicks(float frames, float tickLength);
+}
+
+
+
+namespace ib {
+    namespace {
+        struct Preset {
+            char const* name;
+            bool enabled;
+            float all;
+            float wave;
+        };
+
+        constexpr std::array<Preset, 5> PRESETS {{
+            { "Off",    false, 0.f,  0.f  },
+            { "Light",  true,  0.5f, 0.5f },
+            { "Medium", true,  1.f,  1.f  },
+            { "Heavy",  true,  2.f,  2.f  },
+            { "Max",    true,  4.f,  2.f  },
+        }};
+
+        constexpr std::array<char const*, 5> CYCLE_ORDER {{ "Light", "Medium", "Heavy", "Max", "Off" }};
+
+        Config s_config;
     }
 
-    // Full wipe of all input tracking. realInput must be cleared too, otherwise
-    // deliverPending() sees realInput != appliedInput after a respawn and
-    // injects a press the player never made.
-    void resetState() {
-        resetPending();
-        buf.realInput = false;
-        buf.appliedInput = false;
-        buf.injecting = false;
-        buf.sinceInput = 999;
-        buf.rapid = 0;
+    Config const& config() {
+        return s_config;
     }
 
-    void dropGhosts() {
-        if (buf.ghost1) {
-            buf.ghost1->release();
-            buf.ghost1 = nullptr;
-        }
-        if (buf.ghost2) {
-            buf.ghost2->release();
-            buf.ghost2 = nullptr;
-        }
-        buf.simulating = false;
-        buf.injecting = false;
-        buf.rapid = 0;
-        resetPending();
-    }
+    void reloadConfig() {
+        auto* mod = Mod::get();
+        Config c;
+        c.enabled = mod->getSettingValue<bool>("enabled");
+        c.landingBuffer = mod->getSettingValue<bool>("landing-buffer");
+        c.hotkey = mod->getSettingValue<bool>("hotkey");
+        c.debug = mod->getSettingValue<bool>("debug");
+        c.budgetMs = mod->getSettingValue<double>("sim-budget-ms");
 
-    PlayerObject* makeGhost(PlayLayer* layer) {
-        auto* ghost = PlayerObject::create(1, 1, layer, layer, true);
-        ghost->retain();
-        ghost->setPosition(CCPoint(0.f, 105.f));
-        ghost->setVisible(false);
-        layer->m_objectLayer->addChild(ghost);
-        return ghost;
-    }
-
-    void sendButton(PlayLayer* layer, bool down) {
-        buf.injecting = true;
-        buf.appliedInput = down;
-        layer->handleButton(down, 1, buf.isPlayer1);
-        buf.injecting = false;
-    }
-
-    void pressGhost(PlayerObject* ghost, bool down) {
-        if (down) {
-            ghost->pushButton(PlayerButton::Jump);
+        auto preset = mod->getSettingValue<std::string>("preset");
+        if (preset == "Custom") {
+            c.framesAll = static_cast<float>(mod->getSettingValue<double>("custom-all-frames"));
+            c.framesWave = static_cast<float>(mod->getSettingValue<double>("custom-wave-frames"));
         }
         else {
-            ghost->releaseButton(PlayerButton::Jump);
-        }
-    }
-
-    void copyState(PlayerObject* ghost, PlayerObject* real) {
-        ghost->setVisible(false);
-        ghost->copyAttributes(real);
-        ghost->setScale(real->getScale());
-        ghost->setContentSize(real->getContentSize());
-        ghost->m_width = real->m_width;
-        ghost->m_height = real->m_height;
-        ghost->m_gravityMod = real->m_gravityMod;
-        ghost->m_isOnGround = real->m_isOnGround;
-        ghost->m_isUpsideDown = real->m_isUpsideDown;
-        ghost->m_vehicleSize = real->m_vehicleSize;
-        ghost->m_playerSpeed = real->m_playerSpeed;
-    }
-
-    void advanceGhost(PlayerObject* ghost, float dt) {
-        ghost->update(dt);
-        ghost->updateRotation(dt);
-    }
-
-    void checkGhost(PlayLayer* layer, PlayerObject* ghost, float dt) {
-        ghost->m_collisionLogTop->removeAllObjects();
-        ghost->m_collisionLogBottom->removeAllObjects();
-        ghost->m_collisionLogLeft->removeAllObjects();
-        ghost->m_collisionLogRight->removeAllObjects();
-        layer->checkCollisions(ghost, dt, false);
-    }
-
-    bool isFlying(PlayerObject* player) {
-        return player->m_isShip || player->m_isDart || player->m_isBird || player->m_isSwing;
-    }
-
-    enum class Mode { Cube, Ship, Ball, Ufo, Wave, Robot, Spider, Swing };
-
-    bool inMode(PlayerObject* p, Mode mode) {
-        switch (mode) {
-            case Mode::Ship: return p->m_isShip;
-            case Mode::Ball: return p->m_isBall;
-            case Mode::Ufo: return p->m_isBird;
-            case Mode::Wave: return p->m_isDart;
-            case Mode::Robot: return p->m_isRobot;
-            case Mode::Spider: return p->m_isSpider;
-            case Mode::Swing: return p->m_isSwing;
-            case Mode::Cube:
-                return !(p->m_isShip || p->m_isBall || p->m_isBird || p->m_isDart || p->m_isRobot || p->m_isSpider || p->m_isSwing);
-        }
-        return false;
-    }
-
-    // Switch the ghost to a gamemode with no effects. Everything else is turned
-    // off first so the flags never overlap.
-    void enterMode(PlayerObject* p, Mode mode) {
-        if (inMode(p, mode)) {
-            return;
-        }
-        if (p->m_isShip) p->toggleFlyMode(false, true);
-        if (p->m_isBall) p->toggleRollMode(false, true);
-        if (p->m_isBird) p->toggleBirdMode(false, true);
-        if (p->m_isDart) p->toggleDartMode(false, true);
-        if (p->m_isRobot) p->toggleRobotMode(false, true);
-        if (p->m_isSpider) p->toggleSpiderMode(false, true);
-        if (p->m_isSwing) p->toggleSwingMode(false, true);
-
-        switch (mode) {
-            case Mode::Ship: p->toggleFlyMode(true, true); break;
-            case Mode::Ball: p->toggleRollMode(true, true); break;
-            case Mode::Ufo: p->toggleBirdMode(true, true); break;
-            case Mode::Wave: p->toggleDartMode(true, true); break;
-            case Mode::Robot: p->toggleRobotMode(true, true); break;
-            case Mode::Spider: p->toggleSpiderMode(true, true); break;
-            case Mode::Swing: p->toggleSwingMode(true, true); break;
-            case Mode::Cube: break;
-        }
-    }
-
-    float speedOf(int objectID) {
-        switch (objectID) {
-            case 200: return 0.7f;
-            case 201: return 0.9f;
-            case 202: return 1.1f;
-            case 203: return 1.3f;
-            case 1334: return 1.6f;
-            default: return 0.f;
-        }
-    }
-
-    // Each portal only applies once per ghost per simulation.
-    std::vector<std::pair<PlayerObject*, GameObject*>> simTouched;
-
-    bool firstTouch(PlayerObject* player, GameObject* object) {
-        for (auto const& t : simTouched) {
-            if (t.first == player && t.second == object) {
-                return false;
-            }
-        }
-        simTouched.emplace_back(player, object);
-        return true;
-    }
-
-    // Called when the ghost overlaps a special object during a sim. Applies the
-    // effect to the ghost only, or marks the sim as unsure if it can't be modeled.
-    void touchSpecial(PlayerObject* player, GameObject* object) {
-        float speed = speedOf(object->m_objectID);
-        if (speed > 0.f) {
-            if (!MODEL_SPEED) {
-                buf.simUnsure = true;
-            }
-            else if (firstTouch(player, object)) {
-                player->m_playerSpeed = speed;
-            }
-            return;
-        }
-
-        auto type = object->m_objectType;
-        switch (type) {
-            case GameObjectType::NormalGravityPortal:
-            case GameObjectType::InverseGravityPortal: {
-                if (!MODEL_GRAVITY) {
-                    buf.simUnsure = true;
-                    return;
+            for (auto const& p : PRESETS) {
+                if (preset == p.name) {
+                    c.enabled = c.enabled && p.enabled;
+                    c.framesAll = p.all;
+                    c.framesWave = p.wave;
+                    break;
                 }
-                if (!firstTouch(player, object)) {
-                    return;
+            }
+        }
+        s_config = c;
+    }
+
+    void cyclePreset() {
+        auto* mod = Mod::get();
+        auto current = mod->getSettingValue<std::string>("preset");
+        size_t next = 0; // anything unknown (e.g. Custom) restarts at Light
+        for (size_t i = 0; i < CYCLE_ORDER.size(); ++i) {
+            if (current == CYCLE_ORDER[i]) {
+                next = (i + 1) % CYCLE_ORDER.size();
+                break;
+            }
+        }
+        std::string name = CYCLE_ORDER[next];
+        mod->setSettingValue<std::string>("preset", name);
+        reloadConfig();
+        Notification::create("Input buffer: " + name, NotificationIcon::None, 0.8f)->show();
+        log::info("[InputBuffer] preset -> {}", name);
+    }
+
+    int framesToTicks(float frames, float tickLength) {
+        if (!(tickLength > 0.001f)) {
+            tickLength = 0.25f;
+        }
+        return std::max(0, static_cast<int>(std::lround(frames / tickLength)));
+    }
+}
+
+// ======================================================================================
+// 2. GHOST SIMULATION
+// ======================================================================================
+
+// Ghost simulation: runs invisible copies of the player(s) forward in time to see
+// whether a press at a given delay survives. Nothing here touches the real game state.
+namespace ib::sim {
+    // lifecycle (one ghost pair per PlayLayer)
+    void create(PlayLayer* layer);
+    void destroy();
+
+    // queried by the hooks that must go silent during a simulation
+    bool active();
+    bool isGhost(PlayerObject* player);
+    void markDied();
+
+    // physics tick length in frames @ 60fps (0.25 normally)
+    void setTickLength(float frames);
+    float tickLength();
+    // scale a tick count that was tuned for the default 0.25-frame tick
+    int scaled(int ticksAtDefaultTick);
+
+    // each button press gets a time budget; check timedOut() after sim calls
+    void beginQuery(double budgetMs);
+    bool timedOut();
+
+    bool isCube(PlayerObject* player);
+
+    // During a sim, keep only objects the ghost should really collide with and apply
+    // portal effects to the ghost directly. `out` is then handed to the real collision code.
+    void collectRelevant(PlayerObject* player, gd::vector<GameObject*>* objects, int count, gd::vector<GameObject*>& out);
+
+    // Survived ticks if the button is set to `down` after `delay` ticks (button state before
+    // that is !down). Returns `horizon` if the future looks safe or can't be judged.
+    int run(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, bool* diedBeforeInput);
+
+    // Ticks until the cube touches ground with no input; -1 if it dies, hits something
+    // unmodeled, or doesn't land within maxTicks.
+    int ticksToLanding(PlayLayer* layer, PlayerObject* p1, int maxTicks);
+}
+
+
+
+namespace ib::sim {
+    namespace {
+        constexpr float DEFAULT_TICK = 0.25f;
+        constexpr float GHOST_START_Y = 105.f;
+
+        constexpr uint64_t typeBit(GameObjectType type) {
+            return 1ull << static_cast<int>(type);
+        }
+
+        constexpr uint64_t COLLIDING_TYPES = typeBit(GameObjectType::Solid) | typeBit(GameObjectType::Hazard) | typeBit(GameObjectType::Slope) |
+                                             typeBit(GameObjectType::CollisionObject) | typeBit(GameObjectType::AnimatedHazard);
+
+        // Flip one to false to turn that portal family into a "stop, don't guess" boundary.
+        constexpr bool MODEL_GRAVITY = true;
+        constexpr bool MODEL_SIZE = true;
+        constexpr bool MODEL_SPEED = true;
+        constexpr bool MODEL_MODE = true;
+
+        constexpr uint64_t MODELED_TYPES = typeBit(GameObjectType::NormalGravityPortal) | typeBit(GameObjectType::InverseGravityPortal) |
+                                           typeBit(GameObjectType::RegularSizePortal) | typeBit(GameObjectType::MiniSizePortal) |
+                                           typeBit(GameObjectType::CubePortal) | typeBit(GameObjectType::ShipPortal) |
+                                           typeBit(GameObjectType::BallPortal) | typeBit(GameObjectType::UfoPortal) |
+                                           typeBit(GameObjectType::WavePortal) | typeBit(GameObjectType::RobotPortal) |
+                                           typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal);
+
+        constexpr uint64_t UNMODELED_TYPES = typeBit(GameObjectType::YellowJumpPad) | typeBit(GameObjectType::PinkJumpPad) |
+                                             typeBit(GameObjectType::RedJumpPad) | typeBit(GameObjectType::GravityPad) |
+                                             typeBit(GameObjectType::SpiderPad) | typeBit(GameObjectType::YellowJumpRing) |
+                                             typeBit(GameObjectType::PinkJumpRing) | typeBit(GameObjectType::RedJumpRing) |
+                                             typeBit(GameObjectType::GravityRing) | typeBit(GameObjectType::GreenRing) |
+                                             typeBit(GameObjectType::DropRing) | typeBit(GameObjectType::CustomRing) |
+                                             typeBit(GameObjectType::DashRing) | typeBit(GameObjectType::GravityDashRing) |
+                                             typeBit(GameObjectType::SpiderOrb) | typeBit(GameObjectType::DualPortal) |
+                                             typeBit(GameObjectType::SoloPortal) | typeBit(GameObjectType::InverseMirrorPortal) |
+                                             typeBit(GameObjectType::NormalMirrorPortal) | typeBit(GameObjectType::TeleportPortal) |
+                                             typeBit(GameObjectType::GravityTogglePortal);
+
+        constexpr uint64_t SPECIAL_TYPES = MODELED_TYPES | UNMODELED_TYPES;
+
+        Ref<PlayerObject> s_ghost1;
+        Ref<PlayerObject> s_ghost2;
+
+        bool s_active = false;
+        bool s_died = false;
+        bool s_unsure = false;
+        float s_tick = DEFAULT_TICK;
+
+        std::chrono::steady_clock::time_point s_deadline = std::chrono::steady_clock::time_point::max();
+        bool s_timedOut = false;
+
+        std::vector<std::pair<PlayerObject*, GameObject*>> s_touched;
+
+        // sets s_active for exactly the lifetime of one simulation, whatever path it exits by
+        struct Scope {
+            Scope() { s_active = true; }
+            ~Scope() { s_active = false; }
+        };
+
+        bool expired() {
+            if (s_timedOut) {
+                return true;
+            }
+            if (std::chrono::steady_clock::now() >= s_deadline) {
+                s_timedOut = true;
+            }
+            return s_timedOut;
+        }
+
+        PlayerObject* makeGhost(PlayLayer* layer) {
+            auto* ghost = PlayerObject::create(1, 1, layer, layer, true);
+            if (!ghost) {
+                return nullptr;
+            }
+            ghost->setPosition(CCPoint(0.f, GHOST_START_Y));
+            ghost->setVisible(false);
+            layer->m_objectLayer->addChild(ghost);
+            return ghost;
+        }
+
+        void dropGhost(Ref<PlayerObject>& ghost) {
+            if (ghost) {
+                ghost->removeFromParent();
+                ghost = nullptr;
+            }
+        }
+
+        void setButton(PlayerObject* ghost, bool down) {
+            if (down) {
+                ghost->pushButton(PlayerButton::Jump);
+            }
+            else {
+                ghost->releaseButton(PlayerButton::Jump);
+            }
+        }
+
+        void copyState(PlayerObject* ghost, PlayerObject* real) {
+            ghost->setVisible(false);
+            ghost->copyAttributes(real);
+            ghost->setScale(real->getScale());
+            ghost->setContentSize(real->getContentSize());
+            ghost->m_width = real->m_width;
+            ghost->m_height = real->m_height;
+            ghost->m_gravityMod = real->m_gravityMod;
+            ghost->m_isOnGround = real->m_isOnGround;
+            ghost->m_isUpsideDown = real->m_isUpsideDown;
+            ghost->m_vehicleSize = real->m_vehicleSize;
+            ghost->m_playerSpeed = real->m_playerSpeed;
+        }
+
+        void advance(PlayerObject* ghost, float dt) {
+            ghost->update(dt);
+            ghost->updateRotation(dt);
+        }
+
+        void checkCollisions(PlayLayer* layer, PlayerObject* ghost, float dt) {
+            ghost->m_collisionLogTop->removeAllObjects();
+            ghost->m_collisionLogBottom->removeAllObjects();
+            ghost->m_collisionLogLeft->removeAllObjects();
+            ghost->m_collisionLogRight->removeAllObjects();
+            layer->checkCollisions(ghost, dt, false);
+        }
+
+        bool isFlying(PlayerObject* p) {
+            return p->m_isShip || p->m_isDart || p->m_isBird || p->m_isSwing;
+        }
+
+        enum class Mode { Cube, Ship, Ball, Ufo, Wave, Robot, Spider, Swing };
+
+        bool inMode(PlayerObject* p, Mode mode) {
+            switch (mode) {
+                case Mode::Ship: return p->m_isShip;
+                case Mode::Ball: return p->m_isBall;
+                case Mode::Ufo: return p->m_isBird;
+                case Mode::Wave: return p->m_isDart;
+                case Mode::Robot: return p->m_isRobot;
+                case Mode::Spider: return p->m_isSpider;
+                case Mode::Swing: return p->m_isSwing;
+                case Mode::Cube: return ib::sim::isCube(p);
+            }
+            return false;
+        }
+
+        void enterMode(PlayerObject* p, Mode mode) {
+            if (inMode(p, mode)) {
+                return;
+            }
+            if (p->m_isShip) p->toggleFlyMode(false, true);
+            if (p->m_isBall) p->toggleRollMode(false, true);
+            if (p->m_isBird) p->toggleBirdMode(false, true);
+            if (p->m_isDart) p->toggleDartMode(false, true);
+            if (p->m_isRobot) p->toggleRobotMode(false, true);
+            if (p->m_isSpider) p->toggleSpiderMode(false, true);
+            if (p->m_isSwing) p->toggleSwingMode(false, true);
+
+            switch (mode) {
+                case Mode::Ship: p->toggleFlyMode(true, true); break;
+                case Mode::Ball: p->toggleRollMode(true, true); break;
+                case Mode::Ufo: p->toggleBirdMode(true, true); break;
+                case Mode::Wave: p->toggleDartMode(true, true); break;
+                case Mode::Robot: p->toggleRobotMode(true, true); break;
+                case Mode::Spider: p->toggleSpiderMode(true, true); break;
+                case Mode::Swing: p->toggleSwingMode(true, true); break;
+                case Mode::Cube: break;
+            }
+        }
+
+        float speedOf(int objectID) {
+            switch (objectID) {
+                case 200: return 0.7f;
+                case 201: return 0.9f;
+                case 202: return 1.1f;
+                case 203: return 1.3f;
+                case 1334: return 1.6f;
+                default: return 0.f;
+            }
+        }
+
+        // each portal applies once per ghost per simulation
+        bool firstTouch(PlayerObject* player, GameObject* object) {
+            for (auto const& t : s_touched) {
+                if (t.first == player && t.second == object) {
+                    return false;
                 }
-                bool upsideDown = type == GameObjectType::InverseGravityPortal;
-                if (player->m_isUpsideDown != upsideDown) {
-                    player->flipGravity(upsideDown, true);
+            }
+            s_touched.emplace_back(player, object);
+            return true;
+        }
+
+        void touchSpecial(PlayerObject* player, GameObject* object) {
+            float speed = speedOf(object->m_objectID);
+            if (speed > 0.f) {
+                if (!MODEL_SPEED) {
+                    s_unsure = true;
+                }
+                else if (firstTouch(player, object)) {
+                    player->m_playerSpeed = speed;
                 }
                 return;
             }
-            case GameObjectType::RegularSizePortal:
-            case GameObjectType::MiniSizePortal: {
-                if (!MODEL_SIZE) {
-                    buf.simUnsure = true;
+
+            auto type = object->m_objectType;
+            switch (type) {
+                case GameObjectType::NormalGravityPortal:
+                case GameObjectType::InverseGravityPortal: {
+                    if (!MODEL_GRAVITY) {
+                        s_unsure = true;
+                        return;
+                    }
+                    if (!firstTouch(player, object)) {
+                        return;
+                    }
+                    bool upsideDown = type == GameObjectType::InverseGravityPortal;
+                    if (player->m_isUpsideDown != upsideDown) {
+                        player->flipGravity(upsideDown, true);
+                    }
                     return;
                 }
-                if (!firstTouch(player, object)) {
+                case GameObjectType::RegularSizePortal:
+                case GameObjectType::MiniSizePortal: {
+                    if (!MODEL_SIZE) {
+                        s_unsure = true;
+                        return;
+                    }
+                    if (!firstTouch(player, object)) {
+                        return;
+                    }
+                    bool mini = type == GameObjectType::MiniSizePortal;
+                    if ((player->m_vehicleSize < 1.f) != mini) {
+                        player->togglePlayerScale(mini, true);
+                    }
                     return;
                 }
-                bool mini = type == GameObjectType::MiniSizePortal;
-                if ((player->m_vehicleSize < 1.f) != mini) {
-                    player->togglePlayerScale(mini, true);
+                case GameObjectType::CubePortal:
+                case GameObjectType::ShipPortal:
+                case GameObjectType::BallPortal:
+                case GameObjectType::UfoPortal:
+                case GameObjectType::WavePortal:
+                case GameObjectType::RobotPortal:
+                case GameObjectType::SpiderPortal:
+                case GameObjectType::SwingPortal: {
+                    if (!MODEL_MODE) {
+                        s_unsure = true;
+                        return;
+                    }
+                    if (!firstTouch(player, object)) {
+                        return;
+                    }
+                    Mode mode = Mode::Cube;
+                    switch (type) {
+                        case GameObjectType::ShipPortal: mode = Mode::Ship; break;
+                        case GameObjectType::BallPortal: mode = Mode::Ball; break;
+                        case GameObjectType::UfoPortal: mode = Mode::Ufo; break;
+                        case GameObjectType::WavePortal: mode = Mode::Wave; break;
+                        case GameObjectType::RobotPortal: mode = Mode::Robot; break;
+                        case GameObjectType::SpiderPortal: mode = Mode::Spider; break;
+                        case GameObjectType::SwingPortal: mode = Mode::Swing; break;
+                        default: break;
+                    }
+                    enterMode(player, mode);
+                    return;
                 }
-                return;
+                default:
+                    // pads, orbs, dual/solo/mirror/teleport: not modeled
+                    s_unsure = true;
+                    return;
             }
-            case GameObjectType::CubePortal:
-            case GameObjectType::ShipPortal:
-            case GameObjectType::BallPortal:
-            case GameObjectType::UfoPortal:
-            case GameObjectType::WavePortal:
-            case GameObjectType::RobotPortal:
-            case GameObjectType::SpiderPortal:
-            case GameObjectType::SwingPortal: {
-                if (!MODEL_MODE) {
-                    buf.simUnsure = true;
-                    return;
-                }
-                if (!firstTouch(player, object)) {
-                    return;
-                }
-                Mode mode = Mode::Cube;
-                switch (type) {
-                    case GameObjectType::ShipPortal: mode = Mode::Ship; break;
-                    case GameObjectType::BallPortal: mode = Mode::Ball; break;
-                    case GameObjectType::UfoPortal: mode = Mode::Ufo; break;
-                    case GameObjectType::WavePortal: mode = Mode::Wave; break;
-                    case GameObjectType::RobotPortal: mode = Mode::Robot; break;
-                    case GameObjectType::SpiderPortal: mode = Mode::Spider; break;
-                    case GameObjectType::SwingPortal: mode = Mode::Swing; break;
-                    default: break;
-                }
-                enterMode(player, mode);
-                return;
-            }
-            default:
-                // pads, orbs, dual/solo/mirror/teleport: can't model yet
-                buf.simUnsure = true;
-                return;
+        }
+
+        float simDt() {
+            return (s_tick > 0.001f && s_tick < 2.0f) ? s_tick : DEFAULT_TICK;
         }
     }
 
-    float simDt() {
-        float dt = buf.tickLength;
-        if (!(dt > 0.001f && dt < 2.0f)) {
-            dt = TICK;
-        }
-        return dt;
+    // ---- lifecycle -------------------------------------------------------------------
+
+    void create(PlayLayer* layer) {
+        destroy();
+        s_ghost1 = makeGhost(layer);
+        // ghost2 is created lazily the first time dual mode needs it
     }
 
-    int simulate(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, bool* diedBeforeInput) {
+    void destroy() {
+        dropGhost(s_ghost1);
+        dropGhost(s_ghost2);
+        s_active = false;
+        s_touched.clear();
+    }
+
+    // ---- state -----------------------------------------------------------------------
+
+    bool active() { return s_active; }
+
+    bool isGhost(PlayerObject* player) {
+        return player && (player == s_ghost1.data() || player == s_ghost2.data());
+    }
+
+    void markDied() { s_died = true; }
+
+    void setTickLength(float frames) { s_tick = frames; }
+    float tickLength() { return simDt(); }
+
+    int scaled(int ticksAtDefaultTick) {
+        return std::max(1, static_cast<int>(std::lround(ticksAtDefaultTick * DEFAULT_TICK / simDt())));
+    }
+
+    void beginQuery(double budgetMs) {
+        s_timedOut = false;
+        if (budgetMs > 0.0) {
+            s_deadline = std::chrono::steady_clock::now() +
+                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::milli>(budgetMs));
+        }
+        else {
+            s_deadline = std::chrono::steady_clock::time_point::max();
+        }
+    }
+
+    bool timedOut() { return s_timedOut; }
+
+    bool isCube(PlayerObject* p) {
+        return !(p->m_isShip || p->m_isBall || p->m_isBird || p->m_isDart || p->m_isRobot || p->m_isSpider || p->m_isSwing);
+    }
+
+    // ---- collision filtering ---------------------------------------------------------
+
+    void collectRelevant(PlayerObject* player, gd::vector<GameObject*>* objects, int count, gd::vector<GameObject*>& out) {
+        out.clear();
+        if (static_cast<int>(out.capacity()) < count) {
+            out.reserve(count);
+        }
+        CCRect playerRect;
+        bool haveRect = false;
+        for (int i = 0; i < count; ++i) {
+            auto* object = objects->at(i);
+            if (!object) {
+                continue;
+            }
+            auto type = static_cast<unsigned>(object->m_objectType);
+            if (type < 64 && ((COLLIDING_TYPES >> type) & 1)) {
+                out.push_back(object);
+                continue;
+            }
+            // Portals / pads / orbs never reach the real collision code during a sim.
+            // Check overlap here and apply the effect to the ghost only.
+            bool special = (type < 64 && ((SPECIAL_TYPES >> type) & 1)) || speedOf(object->m_objectID) > 0.f;
+            if (!special) {
+                continue;
+            }
+            if (!haveRect) {
+                playerRect = player->getObjectRect();
+                haveRect = true;
+            }
+            if (playerRect.intersectsRect(object->getObjectRect())) {
+                touchSpecial(player, object);
+            }
+        }
+    }
+
+    // ---- simulation ------------------------------------------------------------------
+
+    int run(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, bool* diedBeforeInput) {
         *diedBeforeInput = false;
-        if (!buf.ghost1) {
+
+        bool second = dual && p2;
+        if (second && !s_ghost2) {
+            s_ghost2 = makeGhost(layer);
+        }
+        PlayerObject* g1 = s_ghost1.data();
+        PlayerObject* g2 = second ? s_ghost2.data() : nullptr;
+        if (!g1 || (second && !g2)) {
             return horizon;
-        }
-        buf.simulating = true;
-        buf.ghostDied = false;
-        buf.simUnsure = false;
-        simTouched.clear();
-
-        bool second = dual && buf.ghost2 && p2;
-        copyState(buf.ghost1, p1);
-        if (second) {
-            copyState(buf.ghost2, p2);
-        }
-
-        float dt = simDt();
-
-        if (delay > 0) {
-            pressGhost(buf.ghost1, !down);
-            if (second) {
-                pressGhost(buf.ghost2, !down);
-            }
         }
 
         int total = delay + horizon;
         if (total <= 0) {
-            buf.simulating = false;
             return 0;
         }
+
+        Scope scope;
+        s_died = false;
+        s_unsure = false;
+        s_touched.clear();
+
+        copyState(g1, p1);
+        if (g2) {
+            copyState(g2, p2);
+        }
+
+        float dt = simDt();
+        if (delay > 0) {
+            setButton(g1, !down);
+            if (g2) setButton(g2, !down);
+        }
+
+        int minAirTicks = scaled(6);
+        int maxGroundTicks = scaled(2);
 
         int survived = 0;
         int airTicks = 0;
@@ -390,42 +573,38 @@ namespace {
         int tick = 0;
         bool died = false;
         for (; tick < total; ++tick) {
+            if (expired()) {
+                return horizon; // caller checks timedOut() and falls back to raw input
+            }
             if (tick == delay) {
-                pressGhost(buf.ghost1, down);
-                if (second) {
-                    pressGhost(buf.ghost2, down);
-                }
+                setButton(g1, down);
+                if (g2) setButton(g2, down);
             }
 
-            advanceGhost(buf.ghost1, dt);
-            if (second) {
-                advanceGhost(buf.ghost2, dt);
-            }
-            if (buf.ghostDied) {
+            advance(g1, dt);
+            if (g2) advance(g2, dt);
+            if (s_died) {
                 died = true;
                 break;
             }
 
-            checkGhost(layer, buf.ghost1, dt);
-            if (buf.simUnsure) {
-                // Hit something we can't model. Checked before death on purpose:
-                // a death on the same tick can't be trusted either. If the input
-                // hasn't been sent yet this variant can't be validated, so it
-                // counts as 0; otherwise everything up to here was valid.
-                buf.simulating = false;
+            checkCollisions(layer, g1, dt);
+            if (s_unsure) {
+                // Checked before death on purpose: a death on the same tick can't be
+                // trusted. If the input hasn't been sent yet this variant can't be
+                // validated (0); otherwise everything up to here was valid.
                 return tick < delay ? 0 : horizon;
             }
-            if (buf.ghostDied) {
+            if (s_died) {
                 died = true;
                 break;
             }
-            if (second) {
-                checkGhost(layer, buf.ghost2, dt);
-                if (buf.simUnsure) {
-                    buf.simulating = false;
+            if (g2) {
+                checkCollisions(layer, g2, dt);
+                if (s_unsure) {
                     return tick < delay ? 0 : horizon;
                 }
-                if (buf.ghostDied) {
+                if (s_died) {
                     died = true;
                     break;
                 }
@@ -436,24 +615,22 @@ namespace {
             }
             ++survived;
 
-            // A portal may have changed the gamemode mid-sim.
-            bool flying = isFlying(buf.ghost1) || (second && isFlying(buf.ghost2));
-            if (flying) {
+            // a portal may have changed the gamemode mid-sim
+            if (isFlying(g1) || (g2 && isFlying(g2))) {
                 continue;
             }
 
-            bool grounded = buf.ghost1->m_isOnGround && (!second || buf.ghost2->m_isOnGround);
+            bool grounded = g1->m_isOnGround && (!g2 || g2->m_isOnGround);
             if (!grounded) {
                 ++airTicks;
                 groundTicks = 0;
                 continue;
             }
-            if (airTicks < 6) {
+            if (airTicks < minAirTicks) {
                 continue;
             }
-            if (groundTicks > 2) {
-                buf.simulating = false;
-                return horizon;
+            if (groundTicks > maxGroundTicks) {
+                return horizon; // came back down and stayed down: safe
             }
             ++groundTicks;
         }
@@ -461,170 +638,278 @@ namespace {
         if (died && tick < delay) {
             *diedBeforeInput = true;
         }
-        buf.simulating = false;
         return survived;
     }
 
-    // Ticks until the cube touches the ground with no button held. Returns -1 if
-    // it dies first, meets something the sim can't model, or doesn't land within
-    // maxTicks.
     int ticksToLanding(PlayLayer* layer, PlayerObject* p1, int maxTicks) {
-        if (!buf.ghost1) {
+        PlayerObject* g1 = s_ghost1.data();
+        if (!g1) {
             return -1;
         }
-        buf.simulating = true;
-        buf.ghostDied = false;
-        buf.simUnsure = false;
-        simTouched.clear();
 
-        copyState(buf.ghost1, p1);
-        pressGhost(buf.ghost1, false);
+        Scope scope;
+        s_died = false;
+        s_unsure = false;
+        s_touched.clear();
+
+        copyState(g1, p1);
+        setButton(g1, false);
 
         float dt = simDt();
-        int landed = -1;
         for (int tick = 1; tick <= maxTicks; ++tick) {
-            advanceGhost(buf.ghost1, dt);
-            if (buf.ghostDied) {
-                break;
+            if (expired()) {
+                return -1;
             }
-            checkGhost(layer, buf.ghost1, dt);
-            if (buf.simUnsure || buf.ghostDied) {
-                break;
+            advance(g1, dt);
+            if (s_died) {
+                return -1;
             }
-            if (buf.ghost1->m_isOnGround) {
-                landed = tick;
-                break;
+            checkCollisions(layer, g1, dt);
+            if (s_unsure || s_died) {
+                return -1;
+            }
+            if (g1->m_isOnGround) {
+                return tick;
             }
         }
-        buf.simulating = false;
-        return landed;
+        return -1;
+    }
+}
+
+// ======================================================================================
+// 3. INPUT BUFFER
+// ======================================================================================
+
+namespace ib {
+    // Owns all real-input bookkeeping. Explicit state machine instead of magic ints:
+    //   Idle    - nothing pending; each tick re-syncs the game's button with the real one
+    //   Waiting - a press/release was swallowed and will be delivered after `countdown_` ticks
+    //   Holding - the buffered press was delivered; keep it down for `holdLeft_` ticks and/or
+    //             deliver a release that arrived early
+    class InputBuffer {
+    public:
+        // Called from GJBaseGameLayer::handleButton. Returns true if the input was swallowed.
+        bool onButton(PlayLayer* layer, GJBaseGameLayer* self, bool down, bool isPlayer1);
+        // Called once per physics tick before PlayerObject::update (player 1 only).
+        void onTick(PlayLayer* layer, PlayerObject* p1);
+        void reset();
+        bool injecting() const { return injecting_; }
+
+    private:
+        enum class Phase { Idle, Waiting, Holding };
+
+        bool pass(bool down);
+        void clearPending();
+        void schedule(bool state, int countdown, int hold);
+        void send(PlayLayer* layer, bool down);
+
+        Phase phase_ = Phase::Idle;
+        int countdown_ = 0;
+        int holdLeft_ = 0;
+        bool pendingState_ = true;
+        bool releaseQueued_ = false;
+
+        bool realInput_ = false;
+        bool appliedInput_ = false;
+        bool injecting_ = false;
+        bool isPlayer1_ = true;
+
+        int sinceInput_ = 999;
+        int rapid_ = 0;
+    };
+
+    InputBuffer& buffer();
+}
+
+
+
+namespace ib {
+    namespace {
+        // The cube landing buffer presses this many ticks BEFORE touchdown and keeps the
+        // button down until touchdown has passed, so the jump comes out on the first
+        // possible tick, exactly like holding the button through a landing.
+        constexpr int LANDING_LEAD = 1;
+
+        // Prediction horizons, in frames @ 60fps (28 / 38 / 72 ticks at the default tick).
+        constexpr float HORIZON_MINI_WAVE = 7.f;
+        constexpr float HORIZON_WAVE = 9.5f;
+        constexpr float HORIZON_OTHER = 18.f;
+
+        // Tuned at the default 0.25-frame tick; scaled with sim::scaled().
+        constexpr int RAPID_GAP_TICKS = 8;     // inputs closer than this count as spam
+        constexpr int CUBE_EXTRA_TICKS = 12;   // a delay must outlive the raw press by this much
+        constexpr int WAVE_EXTRA_TICKS = 10;
+        constexpr int WAVE_GAIN_TICKS = 6;
+        constexpr int WAVE_STEP = 2;           // threshold grows per delay tick (scale-invariant)
     }
 
-    bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
-        auto* layer = GameManager::get()->m_playLayer;
-        if (!layer) {
-            return false;
-        }
+    InputBuffer& buffer() {
+        static InputBuffer instance;
+        return instance;
+    }
+
+    bool InputBuffer::pass(bool down) {
+        appliedInput_ = down;
+        return false;
+    }
+
+    void InputBuffer::clearPending() {
+        phase_ = Phase::Idle;
+        countdown_ = 0;
+        holdLeft_ = 0;
+        releaseQueued_ = false;
+    }
+
+    void InputBuffer::schedule(bool state, int countdown, int hold) {
+        phase_ = Phase::Waiting;
+        pendingState_ = state;
+        countdown_ = countdown;
+        holdLeft_ = hold;
+        releaseQueued_ = false;
+    }
+
+    // Full wipe. realInput_ must be cleared too, otherwise the Idle re-sync would inject a
+    // press the player never made after a respawn.
+    void InputBuffer::reset() {
+        clearPending();
+        realInput_ = false;
+        appliedInput_ = false;
+        injecting_ = false;
+        sinceInput_ = 999;
+        rapid_ = 0;
+    }
+
+    void InputBuffer::send(PlayLayer* layer, bool down) {
+        injecting_ = true;
+        appliedInput_ = down;
+        layer->handleButton(down, 1, isPlayer1_);
+        injecting_ = false;
+    }
+
+    bool InputBuffer::onButton(PlayLayer* layer, GJBaseGameLayer* self, bool down, bool isPlayer1) {
+        auto const& cfg = config();
 
         bool dual = layer->m_gameState.m_isDualMode && layer->m_player2;
-        auto* level = layer->m_level;
-        if (level && !isPlayer1 && level->m_twoPlayerMode) {
+        if (layer->m_level && !isPlayer1 && layer->m_level->m_twoPlayerMode) {
             return false;
         }
 
-        buf.isPlayer1 = isPlayer1;
-        buf.realInput = down;
-        if (!buf.enabled) {
-            buf.appliedInput = down;
-            return false;
+        isPlayer1_ = isPlayer1;
+        realInput_ = down;
+        if (!cfg.enabled) {
+            return pass(down);
         }
 
         auto* p1 = self->m_player1;
         auto* p2 = dual ? layer->m_player2 : nullptr;
         if (!p1 || p1->m_isDead || p1->m_isShip || (p2 && p2->m_isShip)) {
-            resetPending();
-            buf.appliedInput = down;
-            return false;
+            clearPending();
+            return pass(down);
         }
 
-        if (buf.pending >= 0) {
-            buf.releaseQueued = buf.pendingState != down;
-            buf.sinceInput = 0;
+        // ---- input arriving while something is already pending ----
+        if (phase_ == Phase::Waiting) {
+            releaseQueued_ = pendingState_ != down;
+            sinceInput_ = 0;
             return true;
         }
-        if (buf.pending == -2 && !down && buf.holdLeft > 0) {
-            // Real release arrived while the landing press is still guarded.
-            // Hold it back; deliverPending sends it once the guard has expired.
-            buf.releaseQueued = true;
-            buf.sinceInput = 0;
+        if (phase_ == Phase::Holding && !down && holdLeft_ > 0) {
+            // real release arrived while the landing press is still guarded; hold it back
+            releaseQueued_ = true;
+            sinceInput_ = 0;
             return true;
         }
-        if (buf.pending == -2) {
-            resetPending();
-            bool opposite = !buf.pendingState;
-            if (buf.appliedInput != opposite) {
-                sendButton(layer, opposite);
+        if (phase_ == Phase::Holding) {
+            bool opposite = !pendingState_;
+            clearPending();
+            if (appliedInput_ != opposite) {
+                send(layer, opposite);
             }
         }
 
         bool p1Wave = p1->m_isDart;
-        bool anyWave = p1Wave || (p2 && p2->m_isDart);
-        bool mini = (p1Wave && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
+        bool p2Wave = p2 && p2->m_isDart;
+        bool anyWave = p1Wave || p2Wave;
+        bool mini = (p1Wave && p1->m_vehicleSize < 1.f) || (p2Wave && p2->m_vehicleSize < 1.f);
 
-        if (buf.sinceInput < 8) {
-            int before = buf.rapid++;
-            buf.sinceInput = 0;
+        // ---- spam bypass: rapid wave tapping is never buffered ----
+        if (sinceInput_ < sim::scaled(RAPID_GAP_TICKS)) {
+            int before = rapid_++;
+            sinceInput_ = 0;
             if (before >= 2 && anyWave) {
-                buf.appliedInput = down;
-                return false;
+                return pass(down);
             }
         }
         else {
-            buf.sinceInput = 0;
-            buf.rapid = 0;
+            sinceInput_ = 0;
+            rapid_ = 0;
         }
 
+        // ---- releases only matter for wave and robot ----
         if (!p1Wave) {
-            bool robot = p1->m_isRobot;
-            bool wave2 = false;
-            if (p2 && !robot) {
-                wave2 = p2->m_isDart;
-                if (!wave2) {
-                    robot = p2->m_isRobot;
-                }
-            }
-            if (!wave2 && !down && !robot) {
-                buf.appliedInput = false;
-                return false;
+            bool robot = p1->m_isRobot || (p2 && !p2Wave && p2->m_isRobot);
+            if (!p2Wave && !down && !robot) {
+                return pass(down);
             }
         }
 
+        float tick = sim::tickLength();
+        int maxDelay = framesToTicks(anyWave ? cfg.framesWave : cfg.framesAll, tick);
+        if (maxDelay <= 0) {
+            return pass(down);
+        }
+        int horizon = framesToTicks(mini ? HORIZON_MINI_WAVE : (anyWave ? HORIZON_WAVE : HORIZON_OTHER), tick);
         char const* name = down ? "PRESS" : "RELEASE";
-        buf.releaseQueued = false;
-        int horizon = mini ? 28 : (anyWave ? 38 : 72);
-        int maxDelay = anyWave ? buf.ticksWave : buf.ticksAll;
 
+        sim::beginQuery(cfg.budgetMs);
         bool diedEarly = false;
-        int base = simulate(layer, p1, p2, dual, 0, down, horizon, &diedEarly);
+        int base = sim::run(layer, p1, p2, dual, 0, down, horizon, &diedEarly);
+        if (sim::timedOut()) {
+            return pass(down);
+        }
 
-        // Cube landing buffer. A press in mid-air does nothing in-game, and a tap
-        // is gone before touchdown, so the jump never happens. Work out when the
-        // cube lands with no input and fire the press right then, as long as that
-        // is inside the buffer window and no worse than pressing now. This has to
-        // run before the "immediate press is safe" shortcut below, because the
-        // sim holds the button down forever and would call a lost tap safe.
-        if (down && maxDelay > 0 && !dual && !anyWave && !p1->m_isOnGround && inMode(p1, Mode::Cube)) {
-            int land = ticksToLanding(layer, p1, maxDelay);
+        // ---- cube landing buffer ----
+        // A mid-air press does nothing in-game and a tap is gone before touchdown. Work out
+        // when the cube lands with no input and fire the press right then, if that is inside
+        // the window and no worse than pressing now. Must run before the "immediate press is
+        // safe" shortcut, because the sim holds the button forever and would call a lost tap safe.
+        if (cfg.landingBuffer && down && !dual && !anyWave && !p1->m_isOnGround && sim::isCube(p1)) {
+            int land = sim::ticksToLanding(layer, p1, maxDelay);
+            if (sim::timedOut()) {
+                return pass(down);
+            }
             if (land > 0) {
-                // Press slightly before touchdown. A button that is already down
-                // jumps the moment the cube lands, so this can never be later than
-                // holding through the landing. holdLeft keeps it down until the
-                // touchdown tick has passed, even if the real release comes early.
                 int fire = std::max(0, land - LANDING_LEAD);
                 bool diedLate = false;
-                int ret = simulate(layer, p1, p2, dual, fire, down, horizon, &diedLate);
+                int ret = sim::run(layer, p1, p2, dual, fire, down, horizon, &diedLate);
+                if (sim::timedOut()) {
+                    return pass(down);
+                }
                 if (!diedLate && ret >= std::min(base, horizon)) {
-                    std::printf("[InputBuffer] *** LANDING BUFFER %s in %d ticks (lands in %d) (Frame0: %d -> Delayed: %d) [Limit: %d] ***\n",
-                        name, fire, land, base, ret, maxDelay);
-                    buf.pendingState = down;
-                    buf.pending = fire;
-                    buf.holdLeft = land - fire;
+                    if (cfg.debug) {
+                        log::info("[InputBuffer] LANDING BUFFER {} in {} ticks (lands in {}) base={} -> {} limit={}",
+                            name, fire, land, base, ret, maxDelay);
+                    }
+                    schedule(down, fire, land - fire);
                     return true;
                 }
             }
         }
 
-        if (base >= horizon || maxDelay <= 0) {
-            buf.appliedInput = down;
-            return false;
+        if (base >= horizon) {
+            return pass(down); // pressing right now already survives the whole horizon
         }
 
+        // ---- search for the smallest delay that clearly helps ----
         int saved = 0;
         int landed = 0;
         if (!anyWave) {
-            int target = std::min(horizon, base + 12);
+            int target = std::min(horizon, base + sim::scaled(CUBE_EXTRA_TICKS));
             for (int k = 1; k <= maxDelay; ++k) {
-                int ret = simulate(layer, p1, p2, dual, k, down, horizon, &diedEarly);
+                int ret = sim::run(layer, p1, p2, dual, k, down, horizon, &diedEarly);
+                if (sim::timedOut()) {
+                    return pass(down);
+                }
                 if (diedEarly) {
                     break;
                 }
@@ -636,10 +921,13 @@ namespace {
             }
         }
         else {
-            int target = base + 10;
-            int gain = 6;
+            int target = base + sim::scaled(WAVE_EXTRA_TICKS);
+            int gain = sim::scaled(WAVE_GAIN_TICKS);
             for (int k = 1; k <= maxDelay; ++k) {
-                int ret = simulate(layer, p1, p2, dual, k, down, horizon, &diedEarly);
+                int ret = sim::run(layer, p1, p2, dual, k, down, horizon, &diedEarly);
+                if (sim::timedOut()) {
+                    return pass(down);
+                }
                 if (diedEarly) {
                     break;
                 }
@@ -649,156 +937,165 @@ namespace {
                     landed = ret;
                     break;
                 }
-                target += 2;
-                gain += 2;
+                target += WAVE_STEP;
+                gain += WAVE_STEP;
             }
         }
 
         if (saved <= 0) {
-            buf.appliedInput = down;
-            return false;
+            return pass(down);
         }
 
-        std::printf("[InputBuffer] *** SAVED +%d TICKS (%.2f frames @ 60fps) %s! (Frame0: %d -> Delayed: %d) [Limit: %d] ***\n",
-            saved, static_cast<double>(static_cast<float>(saved) * TICK), name, base, landed, maxDelay);
-        buf.pendingState = down;
-        buf.pending = saved;
-        buf.holdLeft = 0;
+        if (cfg.debug) {
+            log::info("[InputBuffer] SAVED +{} ticks ({:.2f} frames) {} base={} -> {} limit={}",
+                saved, saved * tick, name, base, landed, maxDelay);
+        }
+        schedule(down, saved, 0);
         return true;
     }
 
-    void cycleStage() {
-        buf.stage = (buf.stage + 1) % STAGE_COUNT;
-        resetPending();
-        auto const& stage = STAGES[buf.stage];
-        buf.enabled = stage.enabled;
-        buf.ticksAll = stage.ticksAll;
-        buf.ticksWave = stage.ticksWave;
-        std::puts(stage.message);
-    }
-
-    void deliverPending(PlayLayer* layer, PlayerObject* player) {
-        if (buf.sinceInput <= 998) {
-            ++buf.sinceInput;
+    void InputBuffer::onTick(PlayLayer* layer, PlayerObject* p1) {
+        if (sinceInput_ < 999) {
+            ++sinceInput_;
         }
 
         bool dual = layer->m_gameState.m_isDualMode && layer->m_player2;
-        if (player->m_isShip || (dual && layer->m_player2->m_isShip)) {
-            resetPending();
-            if (buf.appliedInput != buf.realInput) {
-                sendButton(layer, buf.realInput);
+        if (p1->m_isShip || (dual && layer->m_player2->m_isShip)) {
+            clearPending();
+            if (appliedInput_ != realInput_) {
+                send(layer, realInput_);
             }
             return;
         }
 
-        if (buf.pending == 0) {
-            if (DEBUG_DELIVERY) {
-                std::printf("[InputBuffer]   delivered %s (onGround=%d, hold guard=%d)\n",
-                    buf.pendingState ? "PRESS" : "RELEASE", player->m_isOnGround ? 1 : 0, buf.holdLeft);
-            }
-            sendButton(layer, buf.pendingState);
-            // -2 = press delivered, still waiting out its hold guard and/or a queued release
-            buf.pending = (buf.releaseQueued || buf.holdLeft > 0) ? -2 : -1;
-        }
-        else if (buf.pending > 0) {
-            --buf.pending;
-        }
-        else if (buf.pending == -1) {
-            if (buf.appliedInput != buf.realInput) {
-                sendButton(layer, buf.realInput);
-            }
-        }
-        else if (buf.pending == -2) {
-            if (buf.holdLeft > 0) {
-                --buf.holdLeft;
-            }
-            else {
-                if (buf.releaseQueued) {
-                    sendButton(layer, !buf.pendingState);
+        switch (phase_) {
+            case Phase::Idle:
+                if (appliedInput_ != realInput_) {
+                    send(layer, realInput_);
                 }
-                buf.releaseQueued = false;
-                buf.pending = -1;
-            }
+                break;
+
+            case Phase::Waiting:
+                if (countdown_ > 0) {
+                    --countdown_;
+                    break;
+                }
+                if (config().debug) {
+                    log::info("[InputBuffer]   delivered {} (onGround={}, hold={})",
+                        pendingState_ ? "PRESS" : "RELEASE", p1->m_isOnGround, holdLeft_);
+                }
+                send(layer, pendingState_);
+                phase_ = (releaseQueued_ || holdLeft_ > 0) ? Phase::Holding : Phase::Idle;
+                break;
+
+            case Phase::Holding:
+                if (holdLeft_ > 0) {
+                    --holdLeft_;
+                    break;
+                }
+                if (releaseQueued_) {
+                    send(layer, !pendingState_);
+                }
+                releaseQueued_ = false;
+                phase_ = Phase::Idle;
+                break;
         }
     }
 }
 
+// ======================================================================================
+// 4. HOOKS
+// ======================================================================================
+
+
+
+namespace {
+    // run our hooks last so we see the final state other mods produced
+    constexpr int HOOK_PRIORITY = -1000000;
+    constexpr int CONFIG_REFRESH_FRAMES = 30;
+
+    bool gdHasFocus() {
+        HWND fg = GetForegroundWindow();
+        if (!fg) {
+            return false;
+        }
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        return pid == GetCurrentProcessId();
+    }
+}
+
 $on_mod(Loaded) {
-    AllocConsole();
-    FILE* out = nullptr;
-    freopen_s(&out, "CONOUT$", "w", stdout);
-    SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
-    std::puts("============================================================");
-    std::puts(" [InputBuffer] v4.7 LOADED (Zero-Lag + Up Arrow Fix)");
-    std::puts(" [InputBuffer] Starting Mode: STAGE 1 (2 All / 2 Wave)");
-    std::puts(" [InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF");
-    std::puts("============================================================");
+    ib::reloadConfig();
+    log::info("[InputBuffer] v2.0.0 loaded");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
     static void onModify(auto& self) {
         (void)self.setHookPriority("PlayLayer::destroyPlayer", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayLayer::playEndAnimationToPos", HOOK_PRIORITY);
-        (void)self.setHookPriority("PlayLayer::flipGravity", HOOK_PRIORITY);
-    }
-
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (buf.simulating && (player == buf.ghost1 || player == buf.ghost2)) {
-            buf.ghostDied = true;
-            return;
-        }
-        resetState();
-        PlayLayer::destroyPlayer(player, object);
     }
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
             return false;
         }
-        auto* layer = GameManager::get()->m_playLayer;
-        if (!layer) {
-            return true;
-        }
-        buf.ghost1 = makeGhost(layer);
-        buf.ghost2 = makeGhost(layer);
-        resetState();
-        buf.isPlayer1 = true;
-        buf.simulating = false;
+        ib::reloadConfig();
+        ib::sim::create(this);
+        ib::buffer().reset();
         return true;
     }
 
-    // Checkpoint / practice / startpos / normal respawns all go through here.
-    // Run the original first so any button calls it makes are handled with the
-    // old state, then wipe so nothing stale survives into the new attempt.
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (ib::sim::active() && ib::sim::isGhost(player)) {
+            ib::sim::markDied();
+            return;
+        }
+        ib::buffer().reset();
+        PlayLayer::destroyPlayer(player, object);
+    }
+
+    // checkpoints / practice / startpos / normal respawns all come through here
     void resetLevel() {
         PlayLayer::resetLevel();
-        resetState();
+        ib::buffer().reset();
     }
 
     void onQuit() {
         PlayLayer::onQuit();
-        dropGhosts();
+        ib::sim::destroy();
+        ib::buffer().reset();
     }
 
     void playEndAnimationToPos(CCPoint position) {
-        if (buf.simulating) {
+        if (ib::sim::active()) {
             return;
         }
         PlayLayer::playEndAnimationToPos(position);
     }
-};
 
-class $modify(BufEditorLayer, LevelEditorLayer) {
-    bool init(GJGameLevel* level, bool noUI) {
-        bool ok = LevelEditorLayer::init(level, noUI);
-        dropGhosts();
-        return ok;
+    // once per frame: pick up setting changes and handle the preset hotkey
+    void postUpdate(float dt) {
+        PlayLayer::postUpdate(dt);
+
+        static int frames = 0;
+        if (++frames >= CONFIG_REFRESH_FRAMES) {
+            frames = 0;
+            ib::reloadConfig();
+        }
+
+        static bool wasDown = false;
+        bool isDown = ib::config().hotkey && gdHasFocus() && (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+        if (isDown && !wasDown) {
+            ib::cyclePreset();
+        }
+        wasDown = isDown;
     }
 };
 
 class $modify(BufHardStreak, HardStreak) {
     void addPoint(CCPoint point) {
-        if (buf.simulating) {
+        if (ib::sim::active()) {
             return;
         }
         HardStreak::addPoint(point);
@@ -807,7 +1104,7 @@ class $modify(BufHardStreak, HardStreak) {
 
 class $modify(BufEffectGameObject, EffectGameObject) {
     void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
-        if (buf.simulating) {
+        if (ib::sim::active()) {
             return;
         }
         EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
@@ -816,7 +1113,7 @@ class $modify(BufEffectGameObject, EffectGameObject) {
 
 class $modify(BufGameObject, GameObject) {
     void playShineEffect() {
-        if (buf.simulating) {
+        if (ib::sim::active()) {
             return;
         }
         GameObject::playShineEffect();
@@ -831,46 +1128,35 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 
     void update(float dt) {
-        if (!buf.simulating) {
-            auto* layer = GameManager::get()->m_playLayer;
+        if (!ib::sim::active()) {
+            auto* layer = PlayLayer::get();
             if (layer && this == layer->m_player1) {
-                if (GetAsyncKeyState(VK_F6) & 1) {
-                    cycleStage();
-                }
-                if (buf.enabled) {
-                    deliverPending(layer, this);
+                float warp = layer->m_gameState.m_timeWarp;
+                ib::sim::setTickLength(warp > 0.f ? dt / warp : dt);
+                if (ib::config().enabled) {
+                    ib::buffer().onTick(layer, this);
                 }
             }
         }
-
         PlayerObject::update(dt);
-
-        auto* layer = GameManager::get()->m_playLayer;
-        if (layer && !buf.simulating) {
-            float warp = layer->m_gameState.m_timeWarp;
-            if (warp > 0.f) {
-                dt /= warp;
-            }
-            buf.tickLength = dt;
-        }
     }
 
     void incrementJumps() {
-        if (buf.simulating) {
+        if (ib::sim::active()) {
             return;
         }
         PlayerObject::incrementJumps();
     }
 
     void playSpiderDashEffect(CCPoint from, CCPoint to) {
-        if (buf.simulating) {
+        if (ib::sim::active()) {
             return;
         }
         PlayerObject::playSpiderDashEffect(from, to);
     }
 
     void ringJump(RingObject* ring, bool skipCheck) {
-        if (buf.simulating) {
+        if (ib::sim::active()) {
             return;
         }
         PlayerObject::ringJump(ring, skipCheck);
@@ -886,62 +1172,34 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
-        if (buf.simulating) {
+        if (ib::sim::active()) {
             return false;
         }
         return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
     }
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int objectCount, float dt) {
-        if (!buf.simulating) {
+        if (!ib::sim::active()) {
             GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
             return;
         }
         static gd::vector<GameObject*> relevant;
-        relevant.clear();
-        if (static_cast<int>(relevant.capacity()) < objectCount) {
-            relevant.reserve(objectCount);
-        }
-        CCRect playerRect;
-        bool haveRect = false;
-        for (int i = 0; i < objectCount; ++i) {
-            auto* object = objects->at(i);
-            if (!object) {
-                continue;
-            }
-            auto type = static_cast<unsigned>(object->m_objectType);
-            if (type < 64 && ((COLLIDING_TYPES >> type) & 1)) {
-                relevant.push_back(object);
-                continue;
-            }
-
-            // Portals / pads / orbs never reach the real collision code during a
-            // sim. Instead, check overlap ourselves and apply the effect to the
-            // ghost only (or flag the sim as unsure).
-            bool special = (type < 64 && ((SPECIAL_TYPES >> type) & 1)) || speedOf(object->m_objectID) > 0.f;
-            if (!special) {
-                continue;
-            }
-            if (!haveRect) {
-                playerRect = player->getObjectRect();
-                haveRect = true;
-            }
-            if (playerRect.intersectsRect(object->getObjectRect())) {
-                touchSpecial(player, object);
-            }
-        }
+        ib::sim::collectRelevant(player, objects, objectCount, relevant);
         GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        if (!buf.simulating && button == 1 && !buf.injecting && intercept(this, down, isPlayer1)) {
-            return;
+        if (button == 1 && !ib::sim::active() && !ib::buffer().injecting()) {
+            auto* layer = PlayLayer::get();
+            if (layer && ib::buffer().onButton(layer, this, down, isPlayer1)) {
+                return;
+            }
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
-        if (buf.simulating) {
+        if (ib::sim::active()) {
             return;
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);
