@@ -1,0 +1,4 @@
+- name: Initialize Geode
+  # You may pin to the exact commit or the version.
+  # uses: entity12208/Geode-Initializer@dcbb2cbec1b914d7256c28ef8b2d34dab503a36f
+  uses: entity12208/Geode-Initializer@v1.0.5
