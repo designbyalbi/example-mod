@@ -1,4 +1,4 @@
-// Predictive Input Buffer v2.0.2 - single-file version
+// Predictive Input Buffer v2.0.3 - single-file version
 // Sections: 1 Config | 2 Ghost simulation | 3 Input buffer | 4 Hooks
 
 #include <Geode/Geode.hpp>
@@ -32,6 +32,7 @@ namespace ib {
         bool landingBuffer = true;
         bool hotkey = true;
         bool debug = false;
+        bool assumeTap = true;        // predict as if you release shortly after takeoff (instead of holding forever)
         bool ignoreUnmodeled = false; // keep predicting through pads/orbs/etc. instead of giving up
         float framesAll = 0.5f;   // buffer window, frames @ 60fps (all modes except wave)
         float framesWave = 0.5f;  // buffer window, frames @ 60fps (wave)
@@ -85,6 +86,7 @@ namespace ib {
         c.hotkey = mod->getSettingValue<bool>("hotkey");
         c.debug = mod->getSettingValue<bool>("debug");
         c.ignoreUnmodeled = mod->getSettingValue<bool>("ignore-unmodeled");
+        c.assumeTap = mod->getSettingValue<bool>("assume-tap");
         c.budgetMs = mod->getSettingValue<double>("sim-budget-ms");
 
         auto preset = mod->getSettingValue<std::string>("preset");
@@ -581,6 +583,9 @@ namespace ib::sim {
 
         int minAirTicks = scaled(6);
         int maxGroundTicks = scaled(2);
+        bool tapModel = ib::config().assumeTap;
+        bool released = false;
+        int tapTicks = scaled(2);
 
         int survived = 0;
         int airTicks = 0;
@@ -639,6 +644,14 @@ namespace ib::sim {
             if (!grounded) {
                 ++airTicks;
                 groundTicks = 0;
+                // Tap model: a cube that has taken off is assumed to be released, so it lands and
+                // the jump can be judged. Holding forever makes it bunny-hop into whatever comes
+                // next, which would make almost every delayed variant look like a death.
+                if (tapModel && down && !released && airTicks >= tapTicks && isCube(g1) && (!g2 || isCube(g2))) {
+                    setButton(g1, false);
+                    if (g2) setButton(g2, false);
+                    released = true;
+                }
                 continue;
             }
             if (airTicks < minAirTicks) {
@@ -928,8 +941,12 @@ namespace ib {
         // ---- search for the smallest delay that clearly helps ----
         int saved = 0;
         int landed = 0;
+        int bestRet = -1;
+        int bestK = 0;
+        int need = 0;
         if (!anyWave) {
             int target = std::min(horizon, base + sim::scaled(CUBE_EXTRA_TICKS));
+            need = target;
             for (int k = 1; k <= maxDelay; ++k) {
                 int ret = sim::run(layer, p1, p2, dual, k, down, horizon, &diedEarly);
                 if (sim::timedOut()) {
@@ -937,6 +954,10 @@ namespace ib {
                 }
                 if (diedEarly) {
                     break;
+                }
+                if (ret > bestRet) {
+                    bestRet = ret;
+                    bestK = k;
                 }
                 if (ret >= target) {
                     saved = k;
@@ -969,7 +990,7 @@ namespace ib {
 
         if (saved <= 0) {
             if (cfg.debug) {
-                log::info("[InputBuffer]   pressing now dies after {} of {} ticks; no delay up to {} ticks does clearly better", base, horizon, maxDelay);
+                log::info("[InputBuffer]   pressing now dies after {} of {} ticks; best delay in window = {} ticks -> survives {} (needed {})", base, horizon, bestK, bestRet, need);
             }
             return pass(down, "no delay inside the window helps");
         }
@@ -1055,7 +1076,7 @@ namespace {
 
 $on_mod(Loaded) {
     ib::reloadConfig();
-    log::info("[InputBuffer] v2.0.2 loaded");
+    log::info("[InputBuffer] v2.0.3 loaded");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
