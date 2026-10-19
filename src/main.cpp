@@ -20,6 +20,15 @@ namespace {
     constexpr float TICK = 0.25f;
     constexpr int STAGE_COUNT = 5;
 
+    // The landing buffer presses this many ticks BEFORE touchdown and keeps the
+    // button down until the touchdown tick has passed, so the jump comes out on
+    // the first possible tick, exactly like holding the button through a landing.
+    constexpr int LANDING_LEAD = 1;
+
+    // Prints a line every time a buffered press/release is actually delivered,
+    // with whether the cube was on the ground at that moment.
+    constexpr bool DEBUG_DELIVERY = true;
+
     constexpr uint64_t typeBit(GameObjectType type) {
         return 1ull << static_cast<int>(type);
     }
@@ -95,11 +104,13 @@ namespace {
         int sinceInput = 999;
         int rapid = 0;
         bool simUnsure = false;
+        int holdLeft = 0;
     } buf;
 
     void resetPending() {
         buf.pending = -1;
         buf.releaseQueued = false;
+        buf.holdLeft = 0;
     }
 
     // Full wipe of all input tracking. realInput must be cleared too, otherwise
@@ -521,9 +532,15 @@ namespace {
             buf.sinceInput = 0;
             return true;
         }
+        if (buf.pending == -2 && !down && buf.holdLeft > 0) {
+            // Real release arrived while the landing press is still guarded.
+            // Hold it back; deliverPending sends it once the guard has expired.
+            buf.releaseQueued = true;
+            buf.sinceInput = 0;
+            return true;
+        }
         if (buf.pending == -2) {
-            buf.pending = -1;
-            buf.releaseQueued = false;
+            resetPending();
             bool opposite = !buf.pendingState;
             if (buf.appliedInput != opposite) {
                 sendButton(layer, opposite);
@@ -579,13 +596,19 @@ namespace {
         if (down && maxDelay > 0 && !dual && !anyWave && !p1->m_isOnGround && inMode(p1, Mode::Cube)) {
             int land = ticksToLanding(layer, p1, maxDelay);
             if (land > 0) {
+                // Press slightly before touchdown. A button that is already down
+                // jumps the moment the cube lands, so this can never be later than
+                // holding through the landing. holdLeft keeps it down until the
+                // touchdown tick has passed, even if the real release comes early.
+                int fire = std::max(0, land - LANDING_LEAD);
                 bool diedLate = false;
-                int ret = simulate(layer, p1, p2, dual, land, down, horizon, &diedLate);
+                int ret = simulate(layer, p1, p2, dual, fire, down, horizon, &diedLate);
                 if (!diedLate && ret >= std::min(base, horizon)) {
-                    std::printf("[InputBuffer] *** LANDING BUFFER +%d TICKS (%.2f frames @ 60fps) %s! (Frame0: %d -> Delayed: %d) [Limit: %d] ***\n",
-                        land, static_cast<double>(static_cast<float>(land) * TICK), name, base, ret, maxDelay);
+                    std::printf("[InputBuffer] *** LANDING BUFFER %s in %d ticks (lands in %d) (Frame0: %d -> Delayed: %d) [Limit: %d] ***\n",
+                        name, fire, land, base, ret, maxDelay);
                     buf.pendingState = down;
-                    buf.pending = land;
+                    buf.pending = fire;
+                    buf.holdLeft = land - fire;
                     return true;
                 }
             }
@@ -640,13 +663,13 @@ namespace {
             saved, static_cast<double>(static_cast<float>(saved) * TICK), name, base, landed, maxDelay);
         buf.pendingState = down;
         buf.pending = saved;
+        buf.holdLeft = 0;
         return true;
     }
 
     void cycleStage() {
         buf.stage = (buf.stage + 1) % STAGE_COUNT;
-        buf.pending = -1;
-        buf.releaseQueued = false;
+        resetPending();
         auto const& stage = STAGES[buf.stage];
         buf.enabled = stage.enabled;
         buf.ticksAll = stage.ticksAll;
@@ -669,14 +692,13 @@ namespace {
         }
 
         if (buf.pending == 0) {
+            if (DEBUG_DELIVERY) {
+                std::printf("[InputBuffer]   delivered %s (onGround=%d, hold guard=%d)\n",
+                    buf.pendingState ? "PRESS" : "RELEASE", player->m_isOnGround ? 1 : 0, buf.holdLeft);
+            }
             sendButton(layer, buf.pendingState);
-            if (buf.releaseQueued) {
-                buf.pending = -2;
-                buf.releaseQueued = false;
-            }
-            else {
-                buf.pending = -1;
-            }
+            // -2 = press delivered, still waiting out its hold guard and/or a queued release
+            buf.pending = (buf.releaseQueued || buf.holdLeft > 0) ? -2 : -1;
         }
         else if (buf.pending > 0) {
             --buf.pending;
@@ -687,9 +709,16 @@ namespace {
             }
         }
         else if (buf.pending == -2) {
-            sendButton(layer, !buf.pendingState);
-            buf.releaseQueued = false;
-            buf.pending = -1;
+            if (buf.holdLeft > 0) {
+                --buf.holdLeft;
+            }
+            else {
+                if (buf.releaseQueued) {
+                    sendButton(layer, !buf.pendingState);
+                }
+                buf.releaseQueued = false;
+                buf.pending = -1;
+            }
         }
     }
 }
