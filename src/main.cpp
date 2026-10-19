@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <utility>
+#include <vector>
 
 using namespace geode::prelude;
 
@@ -24,6 +26,39 @@ namespace {
 
     constexpr uint64_t COLLIDING_TYPES = typeBit(GameObjectType::Solid) | typeBit(GameObjectType::Hazard) | typeBit(GameObjectType::Slope) |
                                          typeBit(GameObjectType::CollisionObject) | typeBit(GameObjectType::AnimatedHazard);
+
+    // Which portal families the ghost sim models. Set one to false and that family
+    // becomes a "stop the sim, don't delay" boundary instead. Handy for bisecting
+    // a crash or a weird prediction.
+    constexpr bool MODEL_GRAVITY = true;
+    constexpr bool MODEL_SIZE = true;
+    constexpr bool MODEL_SPEED = true;
+    constexpr bool MODEL_MODE = true;
+
+    // Portals the ghost applies to itself directly (the game never activates them,
+    // so no shared object state is touched).
+    constexpr uint64_t MODELED_TYPES = typeBit(GameObjectType::NormalGravityPortal) | typeBit(GameObjectType::InverseGravityPortal) |
+                                       typeBit(GameObjectType::RegularSizePortal) | typeBit(GameObjectType::MiniSizePortal) |
+                                       typeBit(GameObjectType::CubePortal) | typeBit(GameObjectType::ShipPortal) |
+                                       typeBit(GameObjectType::BallPortal) | typeBit(GameObjectType::UfoPortal) |
+                                       typeBit(GameObjectType::WavePortal) | typeBit(GameObjectType::RobotPortal) |
+                                       typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal);
+
+    // Things the sim can't model yet. If the ghost touches one, the sim stops and
+    // the buffer stands down instead of guessing. Pads and orbs are next stage.
+    constexpr uint64_t UNMODELED_TYPES = typeBit(GameObjectType::YellowJumpPad) | typeBit(GameObjectType::PinkJumpPad) |
+                                         typeBit(GameObjectType::RedJumpPad) | typeBit(GameObjectType::GravityPad) |
+                                         typeBit(GameObjectType::SpiderPad) | typeBit(GameObjectType::YellowJumpRing) |
+                                         typeBit(GameObjectType::PinkJumpRing) | typeBit(GameObjectType::RedJumpRing) |
+                                         typeBit(GameObjectType::GravityRing) | typeBit(GameObjectType::GreenRing) |
+                                         typeBit(GameObjectType::DropRing) | typeBit(GameObjectType::CustomRing) |
+                                         typeBit(GameObjectType::DashRing) | typeBit(GameObjectType::GravityDashRing) |
+                                         typeBit(GameObjectType::SpiderOrb) | typeBit(GameObjectType::DualPortal) |
+                                         typeBit(GameObjectType::SoloPortal) | typeBit(GameObjectType::InverseMirrorPortal) |
+                                         typeBit(GameObjectType::NormalMirrorPortal) | typeBit(GameObjectType::TeleportPortal) |
+                                         typeBit(GameObjectType::GravityTogglePortal);
+
+    constexpr uint64_t SPECIAL_TYPES = MODELED_TYPES | UNMODELED_TYPES;
 
     struct Stage {
         bool enabled;
@@ -59,11 +94,24 @@ namespace {
         float tickLength = TICK;
         int sinceInput = 999;
         int rapid = 0;
+        bool simUnsure = false;
     } buf;
 
     void resetPending() {
         buf.pending = -1;
         buf.releaseQueued = false;
+    }
+
+    // Full wipe of all input tracking. realInput must be cleared too, otherwise
+    // deliverPending() sees realInput != appliedInput after a respawn and
+    // injects a press the player never made.
+    void resetState() {
+        resetPending();
+        buf.realInput = false;
+        buf.appliedInput = false;
+        buf.injecting = false;
+        buf.sinceInput = 999;
+        buf.rapid = 0;
     }
 
     void dropGhosts() {
@@ -134,7 +182,156 @@ namespace {
     }
 
     bool isFlying(PlayerObject* player) {
-        return player->m_isDart || player->m_isBird || player->m_isSwing;
+        return player->m_isShip || player->m_isDart || player->m_isBird || player->m_isSwing;
+    }
+
+    enum class Mode { Cube, Ship, Ball, Ufo, Wave, Robot, Spider, Swing };
+
+    bool inMode(PlayerObject* p, Mode mode) {
+        switch (mode) {
+            case Mode::Ship: return p->m_isShip;
+            case Mode::Ball: return p->m_isBall;
+            case Mode::Ufo: return p->m_isBird;
+            case Mode::Wave: return p->m_isDart;
+            case Mode::Robot: return p->m_isRobot;
+            case Mode::Spider: return p->m_isSpider;
+            case Mode::Swing: return p->m_isSwing;
+            case Mode::Cube:
+                return !(p->m_isShip || p->m_isBall || p->m_isBird || p->m_isDart || p->m_isRobot || p->m_isSpider || p->m_isSwing);
+        }
+        return false;
+    }
+
+    // Switch the ghost to a gamemode with no effects. Everything else is turned
+    // off first so the flags never overlap.
+    void enterMode(PlayerObject* p, Mode mode) {
+        if (inMode(p, mode)) {
+            return;
+        }
+        if (p->m_isShip) p->toggleFlyMode(false, true);
+        if (p->m_isBall) p->toggleRollMode(false, true);
+        if (p->m_isBird) p->toggleBirdMode(false, true);
+        if (p->m_isDart) p->toggleDartMode(false, true);
+        if (p->m_isRobot) p->toggleRobotMode(false, true);
+        if (p->m_isSpider) p->toggleSpiderMode(false, true);
+        if (p->m_isSwing) p->toggleSwingMode(false, true);
+
+        switch (mode) {
+            case Mode::Ship: p->toggleFlyMode(true, true); break;
+            case Mode::Ball: p->toggleRollMode(true, true); break;
+            case Mode::Ufo: p->toggleBirdMode(true, true); break;
+            case Mode::Wave: p->toggleDartMode(true, true); break;
+            case Mode::Robot: p->toggleRobotMode(true, true); break;
+            case Mode::Spider: p->toggleSpiderMode(true, true); break;
+            case Mode::Swing: p->toggleSwingMode(true, true); break;
+            case Mode::Cube: break;
+        }
+    }
+
+    float speedOf(int objectID) {
+        switch (objectID) {
+            case 200: return 0.7f;
+            case 201: return 0.9f;
+            case 202: return 1.1f;
+            case 203: return 1.3f;
+            case 1334: return 1.6f;
+            default: return 0.f;
+        }
+    }
+
+    // Each portal only applies once per ghost per simulation.
+    std::vector<std::pair<PlayerObject*, GameObject*>> simTouched;
+
+    bool firstTouch(PlayerObject* player, GameObject* object) {
+        for (auto const& t : simTouched) {
+            if (t.first == player && t.second == object) {
+                return false;
+            }
+        }
+        simTouched.emplace_back(player, object);
+        return true;
+    }
+
+    // Called when the ghost overlaps a special object during a sim. Applies the
+    // effect to the ghost only, or marks the sim as unsure if it can't be modeled.
+    void touchSpecial(PlayerObject* player, GameObject* object) {
+        float speed = speedOf(object->m_objectID);
+        if (speed > 0.f) {
+            if (!MODEL_SPEED) {
+                buf.simUnsure = true;
+            }
+            else if (firstTouch(player, object)) {
+                player->m_playerSpeed = speed;
+            }
+            return;
+        }
+
+        auto type = object->m_objectType;
+        switch (type) {
+            case GameObjectType::NormalGravityPortal:
+            case GameObjectType::InverseGravityPortal: {
+                if (!MODEL_GRAVITY) {
+                    buf.simUnsure = true;
+                    return;
+                }
+                if (!firstTouch(player, object)) {
+                    return;
+                }
+                bool upsideDown = type == GameObjectType::InverseGravityPortal;
+                if (player->m_isUpsideDown != upsideDown) {
+                    player->flipGravity(upsideDown, true);
+                }
+                return;
+            }
+            case GameObjectType::RegularSizePortal:
+            case GameObjectType::MiniSizePortal: {
+                if (!MODEL_SIZE) {
+                    buf.simUnsure = true;
+                    return;
+                }
+                if (!firstTouch(player, object)) {
+                    return;
+                }
+                bool mini = type == GameObjectType::MiniSizePortal;
+                if ((player->m_vehicleSize < 1.f) != mini) {
+                    player->togglePlayerScale(mini, true);
+                }
+                return;
+            }
+            case GameObjectType::CubePortal:
+            case GameObjectType::ShipPortal:
+            case GameObjectType::BallPortal:
+            case GameObjectType::UfoPortal:
+            case GameObjectType::WavePortal:
+            case GameObjectType::RobotPortal:
+            case GameObjectType::SpiderPortal:
+            case GameObjectType::SwingPortal: {
+                if (!MODEL_MODE) {
+                    buf.simUnsure = true;
+                    return;
+                }
+                if (!firstTouch(player, object)) {
+                    return;
+                }
+                Mode mode = Mode::Cube;
+                switch (type) {
+                    case GameObjectType::ShipPortal: mode = Mode::Ship; break;
+                    case GameObjectType::BallPortal: mode = Mode::Ball; break;
+                    case GameObjectType::UfoPortal: mode = Mode::Ufo; break;
+                    case GameObjectType::WavePortal: mode = Mode::Wave; break;
+                    case GameObjectType::RobotPortal: mode = Mode::Robot; break;
+                    case GameObjectType::SpiderPortal: mode = Mode::Spider; break;
+                    case GameObjectType::SwingPortal: mode = Mode::Swing; break;
+                    default: break;
+                }
+                enterMode(player, mode);
+                return;
+            }
+            default:
+                // pads, orbs, dual/solo/mirror/teleport: can't model yet
+                buf.simUnsure = true;
+                return;
+        }
     }
 
     int simulate(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, bool* diedBeforeInput) {
@@ -144,6 +341,8 @@ namespace {
         }
         buf.simulating = true;
         buf.ghostDied = false;
+        buf.simUnsure = false;
+        simTouched.clear();
 
         bool second = dual && buf.ghost2 && p2;
         copyState(buf.ghost1, p1);
@@ -163,7 +362,6 @@ namespace {
             }
         }
 
-        bool flying = isFlying(p1) || (dual && p2 && isFlying(p2));
         int total = delay + horizon;
         if (total <= 0) {
             buf.simulating = false;
@@ -193,12 +391,24 @@ namespace {
             }
 
             checkGhost(layer, buf.ghost1, dt);
+            if (buf.simUnsure) {
+                // Hit something we can't model. Checked before death on purpose:
+                // a death on the same tick can't be trusted either. If the input
+                // hasn't been sent yet this variant can't be validated, so it
+                // counts as 0; otherwise everything up to here was valid.
+                buf.simulating = false;
+                return tick < delay ? 0 : horizon;
+            }
             if (buf.ghostDied) {
                 died = true;
                 break;
             }
             if (second) {
                 checkGhost(layer, buf.ghost2, dt);
+                if (buf.simUnsure) {
+                    buf.simulating = false;
+                    return tick < delay ? 0 : horizon;
+                }
                 if (buf.ghostDied) {
                     died = true;
                     break;
@@ -209,6 +419,9 @@ namespace {
                 continue;
             }
             ++survived;
+
+            // A portal may have changed the gamemode mid-sim.
+            bool flying = isFlying(buf.ghost1) || (second && isFlying(buf.ghost2));
             if (flying) {
                 continue;
             }
@@ -443,10 +656,7 @@ class $modify(BufPlayLayer, PlayLayer) {
             buf.ghostDied = true;
             return;
         }
-        buf.pending = -1;
-        buf.releaseQueued = false;
-        buf.appliedInput = false;
-        buf.rapid = 0;
+        resetState();
         PlayLayer::destroyPlayer(player, object);
     }
 
@@ -460,16 +670,18 @@ class $modify(BufPlayLayer, PlayLayer) {
         }
         buf.ghost1 = makeGhost(layer);
         buf.ghost2 = makeGhost(layer);
-        buf.pending = -1;
-        buf.releaseQueued = false;
-        buf.realInput = false;
-        buf.appliedInput = false;
+        resetState();
         buf.isPlayer1 = true;
         buf.simulating = false;
-        buf.injecting = false;
-        buf.sinceInput = 999;
-        buf.rapid = 0;
         return true;
+    }
+
+    // Checkpoint / practice / startpos / normal respawns all go through here.
+    // Run the original first so any button calls it makes are handled with the
+    // old state, then wipe so nothing stale survives into the new attempt.
+    void resetLevel() {
+        PlayLayer::resetLevel();
+        resetState();
     }
 
     void onQuit() {
@@ -599,14 +811,32 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         if (static_cast<int>(relevant.capacity()) < objectCount) {
             relevant.reserve(objectCount);
         }
+        CCRect playerRect;
+        bool haveRect = false;
         for (int i = 0; i < objectCount; ++i) {
             auto* object = objects->at(i);
             if (!object) {
                 continue;
             }
             auto type = static_cast<unsigned>(object->m_objectType);
-            if (type <= 47 && ((COLLIDING_TYPES >> type) & 1)) {
+            if (type < 64 && ((COLLIDING_TYPES >> type) & 1)) {
                 relevant.push_back(object);
+                continue;
+            }
+
+            // Portals / pads / orbs never reach the real collision code during a
+            // sim. Instead, check overlap ourselves and apply the effect to the
+            // ghost only (or flag the sim as unsure).
+            bool special = (type < 64 && ((SPECIAL_TYPES >> type) & 1)) || speedOf(object->m_objectID) > 0.f;
+            if (!special) {
+                continue;
+            }
+            if (!haveRect) {
+                playerRect = player->getObjectRect();
+                haveRect = true;
+            }
+            if (playerRect.intersectsRect(object->getObjectRect())) {
+                touchSpecial(player, object);
             }
         }
         GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
