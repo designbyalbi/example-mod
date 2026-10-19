@@ -1,4 +1,4 @@
-// Predictive Input Buffer v2.0.3 - single-file version
+// Predictive Input Buffer v2.0.4 - single-file version
 // Sections: 1 Config | 2 Ghost simulation | 3 Input buffer | 4 Hooks
 
 #include <Geode/Geode.hpp>
@@ -892,8 +892,8 @@ namespace ib {
         int horizon = framesToTicks(mini ? HORIZON_MINI_WAVE : (anyWave ? HORIZON_WAVE : HORIZON_OTHER), tick);
         char const* name = down ? "PRESS" : "RELEASE";
         if (cfg.debug) {
-            log::info("[InputBuffer] {} cube={} wave={} dual={} onGround={} window={}t horizon={}t",
-                name, sim::isCube(p1), anyWave, dual, p1->m_isOnGround, maxDelay, horizon);
+            log::info("[InputBuffer] {} cube={} wave={} dual={} onGround={} window={}t horizon={}t x={:.0f} speed={:.2f} tick={:.3f}",
+                name, sim::isCube(p1), anyWave, dual, p1->m_isOnGround, maxDelay, horizon, p1->getPositionX(), p1->m_playerSpeed, tick);
         }
 
         sim::beginQuery(cfg.budgetMs);
@@ -944,6 +944,7 @@ namespace ib {
         int bestRet = -1;
         int bestK = 0;
         int need = 0;
+        std::string trace; // k:survivedTicks for every delay tried ('?' = hit unmodeled object, 'x' = died before the press)
         if (!anyWave) {
             int target = std::min(horizon, base + sim::scaled(CUBE_EXTRA_TICKS));
             need = target;
@@ -952,6 +953,7 @@ namespace ib {
                 if (sim::timedOut()) {
                     return pass(down, "prediction exceeded the time budget (raise it in settings)");
                 }
+                trace += std::to_string(k) + ":" + std::to_string(ret) + (sim::unsure() ? "?" : "") + (diedEarly ? "x" : "") + " ";
                 if (diedEarly) {
                     break;
                 }
@@ -991,6 +993,7 @@ namespace ib {
         if (saved <= 0) {
             if (cfg.debug) {
                 log::info("[InputBuffer]   pressing now dies after {} of {} ticks; best delay in window = {} ticks -> survives {} (needed {})", base, horizon, bestK, bestRet, need);
+                log::info("[InputBuffer]   delay curve (k:survived): {}", trace);
             }
             return pass(down, "no delay inside the window helps");
         }
@@ -1076,7 +1079,7 @@ namespace {
 
 $on_mod(Loaded) {
     ib::reloadConfig();
-    log::info("[InputBuffer] v2.0.3 loaded");
+    log::info("[InputBuffer] v2.0.4 loaded");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
