@@ -311,7 +311,7 @@ namespace {
 
         char const* name = down ? "PRESS" : "RELEASE";
         buf.releaseQueued = false;
-        int horizon = mini ? 28 : (anyWave ? 38 : 64);
+        int horizon = mini ? 28 : (anyWave ? 38 : 72);
         int maxDelay = anyWave ? buf.ticksWave : buf.ticksAll;
 
         bool diedEarly = false;
