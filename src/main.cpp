@@ -1,4 +1,4 @@
-// Predictive Input Buffer v2.0.5 - single-file version
+// Predictive Input Buffer v2.0.6 - single-file version
 // Sections: 1 Config | 2 Ghost simulation | 3 Input buffer | 4 Hooks
 
 #include <Geode/Geode.hpp>
@@ -736,6 +736,8 @@ namespace ib {
         int holdLeft_ = 0;
         bool pendingState_ = true;
         bool releaseQueued_ = false;
+        bool repress_ = false;     // press -> release -> press all arrived inside one delay
+        bool repressDue_ = false;  // the second press is delivered one tick after the release
 
         bool realInput_ = false;
         bool appliedInput_ = false;
@@ -764,7 +766,10 @@ namespace ib {
         // A cube jump stays airborne for ~23 frames, so ground modes must look further than that
         // or an early press that lands on a hazard after the horizon is wrongly judged safe.
         constexpr float HORIZON_GROUND = 32.f;  // cube, ball, robot, spider
-        constexpr float HORIZON_FLYING = 18.f;  // ufo, swing (never "land", so keep sims short)
+        // UFO / swing: the sim assumes NO further clicks, but a real player clicks again within a few
+        // frames, so a long look-ahead makes every variant look like a death. Judge only the
+        // immediate result of this click.
+        constexpr float HORIZON_FLAP = 10.f;
 
         // Tuned at the default 0.25-frame tick; scaled with sim::scaled().
         constexpr int RAPID_GAP_TICKS = 8;     // inputs closer than this count as spam
@@ -792,6 +797,8 @@ namespace ib {
         countdown_ = 0;
         holdLeft_ = 0;
         releaseQueued_ = false;
+        repress_ = false;
+        repressDue_ = false;
     }
 
     void InputBuffer::schedule(bool state, int countdown, int hold) {
@@ -800,6 +807,8 @@ namespace ib {
         countdown_ = countdown;
         holdLeft_ = hold;
         releaseQueued_ = false;
+        repress_ = false;
+        repressDue_ = false;
     }
 
     // Full wipe. realInput_ must be cleared too, otherwise the Idle re-sync would inject a
@@ -843,7 +852,13 @@ namespace ib {
 
         // ---- input arriving while something is already pending ----
         if (phase_ == Phase::Waiting) {
-            releaseQueued_ = pendingState_ != down;
+            if (down != pendingState_) {
+                releaseQueued_ = true;   // release arrived during the delay: replay it after the press
+                repress_ = false;
+            }
+            else if (releaseQueued_) {
+                repress_ = true;         // second press arrived: keep it instead of dropping it
+            }
             sinceInput_ = 0;
             return true;
         }
@@ -855,8 +870,12 @@ namespace ib {
         }
         if (phase_ == Phase::Holding) {
             bool opposite = !pendingState_;
+            bool flushRepress = repressDue_;
             clearPending();
-            if (appliedInput_ != opposite) {
+            if (flushRepress) {
+                send(layer, pendingState_);
+            }
+            else if (appliedInput_ != opposite) {
                 send(layer, opposite);
             }
         }
@@ -893,12 +912,13 @@ namespace ib {
             return pass(down, "window is 0 ticks (preset Off?)");
         }
         bool groundMode = sim::isCube(p1) || p1->m_isBall || p1->m_isRobot || p1->m_isSpider;
+        bool flapMode = p1->m_isBird || p1->m_isSwing || (p2 && (p2->m_isBird || p2->m_isSwing));
         int horizon = framesToTicks(
-            mini ? HORIZON_MINI_WAVE : (anyWave ? HORIZON_WAVE : (groundMode ? HORIZON_GROUND : HORIZON_FLYING)), tick);
+            mini ? HORIZON_MINI_WAVE : (anyWave ? HORIZON_WAVE : (groundMode ? HORIZON_GROUND : HORIZON_FLAP)), tick);
         char const* name = down ? "PRESS" : "RELEASE";
         if (cfg.debug) {
-            log::info("[InputBuffer] {} cube={} wave={} dual={} onGround={} window={}t horizon={}t x={:.0f} speed={:.2f} tick={:.3f}",
-                name, sim::isCube(p1), anyWave, dual, p1->m_isOnGround, maxDelay, horizon, p1->getPositionX(), p1->m_playerSpeed, tick);
+            log::info("[InputBuffer] {} cube={} ufo={} wave={} dual={} onGround={} window={}t horizon={}t x={:.0f} speed={:.2f} tick={:.3f}",
+                name, sim::isCube(p1), p1->m_isBird, anyWave, dual, p1->m_isOnGround, maxDelay, horizon, p1->getPositionX(), p1->m_playerSpeed, tick);
         }
 
         sim::beginQuery(cfg.budgetMs);
@@ -1050,10 +1070,21 @@ namespace ib {
                     --holdLeft_;
                     break;
                 }
+                if (repressDue_) {
+                    repressDue_ = false;
+                    send(layer, pendingState_);
+                    phase_ = Phase::Idle;
+                    break;
+                }
                 if (releaseQueued_) {
                     send(layer, !pendingState_);
+                    releaseQueued_ = false;
+                    if (repress_) {
+                        repress_ = false;
+                        repressDue_ = true;   // stay in Holding; press again next tick
+                        break;
+                    }
                 }
-                releaseQueued_ = false;
                 phase_ = Phase::Idle;
                 break;
         }
@@ -1084,7 +1115,7 @@ namespace {
 
 $on_mod(Loaded) {
     ib::reloadConfig();
-    log::info("[InputBuffer] v2.0.5 loaded");
+    log::info("[InputBuffer] v2.0.6 loaded");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
