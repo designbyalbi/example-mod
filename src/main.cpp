@@ -62,17 +62,15 @@ class $modify(ClickbotPlayLayer, PlayLayer) {
     }
 };
 
-// Runs once per physics step: feed in any clicks that are due
 class $modify(ClickbotBaseLayer, GJBaseGameLayer) {
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (!g_events.empty() && static_cast<GJBaseGameLayer*>(PlayLayer::get()) == this) {
             while (g_next < g_events.size() && g_events[g_next].time <= g_time) {
-                // handleButton(down, button, isPlayer1)
                 this->handleButton(g_events[g_next].down, 1, true);
                 ++g_next;
             }
             g_time += dt;
         }
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
