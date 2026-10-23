@@ -1,79 +1,35 @@
 {
-	"geode": "5.11.2",
-	"gd": {
-		"win": "2.2081"
-	},
-	"version": "v2.0.6",
-	"id": "ai.predictivebuffer",
-	"name": "Predictive Input Buffer",
-	"developer": "lilWC",
-	"description": "Trajectory-based press and wave-release input buffer with a landing buffer for cube.",
-	"settings": {
-		"enabled": {
-			"type": "bool",
-			"name": "Enabled",
-			"description": "Master switch.",
-			"default": true
-		},
-		"preset": {
-			"type": "string",
-			"name": "Buffer preset",
-			"description": "Buffer window size. Press F6 in a level to cycle Light, Medium, Heavy, Max, Off.",
-			"default": "Light",
-			"one-of": ["Off", "Light", "Medium", "Heavy", "Max", "Custom"]
-		},
-		"custom-all-frames": {
-			"type": "float",
-			"name": "Custom window: all modes (frames @ 60fps)",
-			"description": "Only used when the preset is Custom.",
-			"default": 0.5,
-			"min": 0,
-			"max": 8
-		},
-		"custom-wave-frames": {
-			"type": "float",
-			"name": "Custom window: wave (frames @ 60fps)",
-			"description": "Only used when the preset is Custom.",
-			"default": 0.5,
-			"min": 0,
-			"max": 8
-		},
-		"landing-buffer": {
-			"type": "bool",
-			"name": "Cube landing buffer",
-			"description": "Fire a mid-air press at touchdown if it lands inside the window.",
-			"default": true
-		},
-		"hotkey": {
-			"type": "bool",
-			"name": "F6 preset hotkey",
-			"default": true
-		},
-		"sim-budget-ms": {
-			"type": "float",
-			"name": "Prediction time budget (ms)",
-			"description": "If predicting a press takes longer than this, the raw input is used instead. 0 = unlimited.",
-			"default": 3.0,
-			"min": 0,
-			"max": 20
-		},
-		"assume-tap": {
-			"type": "bool",
-			"name": "Predict a tap, not a hold",
-			"description": "Assume you release shortly after a cube takes off, instead of holding the button forever. Holding forever makes the predictor think you bunny-hop into the next obstacle, which hides valid rescues.",
-			"default": true
-		},
-		"ignore-unmodeled": {
-			"type": "bool",
-			"name": "Predict through pads/orbs (experimental)",
-			"description": "By default the prediction stops when it touches a pad, orb, dual/mirror/teleport portal, etc. and your raw input is used. Turn this on to ignore those objects and keep predicting. Can mispredict jumps that rely on them.",
-			"default": false
-		},
-		"debug": {
-			"type": "bool",
-			"name": "Debug logging",
-			"description": "Log every buffered/delivered input to the Geode log.",
-			"default": false
-		}
-	}
+  "geode": "4.0.1",
+  "gd": "2.2081",
+  "id": "yourname.audio-clickbot",
+  "name": "Audio Clickbot",
+  "version": "v1.0.0",
+  "developer": "yourname",
+  "description": "Replays clicks from a macro file generated from an audio recording of clicks.",
+  "settings": {
+    "play-macro": {
+      "name": "Play macro",
+      "description": "Inject the clicks from the macro file into the level.",
+      "type": "bool",
+      "default": true
+    },
+    "macro-file": {
+      "name": "Macro file",
+      "description": "Text file made by tools/audio_to_macro.py",
+      "type": "file",
+      "default": "",
+      "control": {
+        "dialog": "open",
+        "filters": [{ "files": ["*.txt"], "description": "Macro (*.txt)" }]
+      }
+    },
+    "offset-ms": {
+      "name": "Offset (ms)",
+      "description": "Shift all clicks later (+) or earlier (-) to sync with the level.",
+      "type": "int",
+      "default": 0,
+      "min": -2000,
+      "max": 2000
+    }
+  }
 }
